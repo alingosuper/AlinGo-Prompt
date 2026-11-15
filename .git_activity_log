@@ -884,3 +884,4 @@ commit at 2026-11-12T09:00:00 - style(ui): align rounded cards and green/blue ae
 commit at 2026-11-12T09:00:00 - test(suite): add comprehensive unit tests and mock integration helpers
 commit at 2026-11-14T09:00:00 - feat(core): initialize modular architecture and base parser bindings
 commit at 2026-11-14T09:00:00 - style(ui): align rounded cards and green/blue aesthetic guidelines
+commit at 2026-11-15T09:00:00 - fix(runtime): resolve memory leak during asynchronous event loop execution
