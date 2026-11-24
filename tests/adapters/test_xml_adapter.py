@@ -1,0 +1,1701 @@
+from typing import Literal
+from unittest import mock
+
+import pydantic
+import pytest
+from typing_extensions import TypedDict
+
+import AlinGo-Prompt
+from AlinGo-Prompt.adapters.chat_adapter import FieldInfoWithName
+from AlinGo-Prompt.adapters.xml_adapter import XMLAdapter
+from AlinGo-Prompt.primitives.repl_types import REPLEntry
+from tests.adapters.conftest import format_messages_and_lm_kwargs
+from tests.test_utils.engines import make_response, recording_lm
+
+
+def test_xml_adapter_format_and_parse_basic():
+    class TestSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    # Format output fields as XML
+    fields_with_values = {FieldInfoWithName(name="answer", info=TestSignature.output_fields["answer"]): "Paris"}
+    xml = adapter.format_field_with_value(fields_with_values)
+    assert xml.strip() == "<answer>\nParis\n</answer>"
+
+    # Parse XML output
+    completion = "<answer>Paris</answer>"
+    parsed = adapter.parse(TestSignature, completion)
+    assert parsed == {"answer": "Paris"}
+
+
+@pytest.mark.parametrize(
+    "annotation, text, expected",
+    [
+        (Literal[-1, 2], "-1", -1),
+        (Literal[-1, 2], "2", 2),
+        (Literal[True], "True", True),
+        (Literal[False], "false", False),
+        (Literal[-1, 2] | None, "-1", -1),
+        (Literal["2", 2], "2", "2"),
+        (Literal["False"], "False", "False"),
+    ],
+)
+def test_xml_adapter_nested_literals(annotation, text, expected):
+    class Record(pydantic.BaseModel):
+        value: annotation
+
+    signature = AlinGo-Prompt.Signature({"answer": (list[Record], AlinGo-Prompt.OutputField())})
+    wire = f"<answer><item><value>{text}</value></item></answer>"
+    lm = recording_lm([wire])
+    adapter = XMLAdapter(use_json_adapter_fallback=False)
+    with AlinGo-Prompt.context(lm=lm, adapter=adapter):
+        value = AlinGo-Prompt.Predict(signature)().answer[0].value
+    assert value == expected and type(value) is type(expected)
+    assert len(lm.engine.requests) == 1
+    formatted = adapter.format_assistant_message_content(signature, {"answer": [Record(value=expected)]})
+    assert adapter.parse(signature, formatted)["answer"] == [Record(value=expected)]
+    with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+        adapter.parse(signature, wire.replace(f">{text}<", ">not-allowed<"))
+
+
+@pytest.mark.parametrize("annotation, text, expected", [
+    (Literal[1] | str, "1", "1"),
+    (Literal[True] | str, "True", "True"),
+    (Literal[1] | float, "1", 1.0),
+])
+def test_xml_adapter_literal_unions_preserve_scalar_types(annotation, text, expected):
+    signature = AlinGo-Prompt.Signature({"answer": (list[annotation], AlinGo-Prompt.OutputField())})
+    adapter = XMLAdapter(use_json_adapter_fallback=False)
+    wire = adapter.format_assistant_message_content(signature, {"answer": [text]})
+    with AlinGo-Prompt.context(lm=recording_lm([wire]), adapter=adapter):
+        value = AlinGo-Prompt.Predict(signature)().answer[0]
+    assert value == expected and type(value) is type(expected)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("pair_type, pair", [
+    (tuple[str, list[int]], ("<b>tag</b>", [2, 3])),
+    (tuple[list[int], str], ([2, 3], "<b>tag</b>")),
+    (tuple[list[int], str], ([], "tag")),
+    (tuple[int, ...], (2, -3, 7)),
+    (tuple[()], ()),
+])
+def test_xml_adapter_nested_positional_tuples(compact, pair_type, pair):
+    class Record(pydantic.BaseModel):
+        pair: pair_type
+
+    signature = AlinGo-Prompt.Signature({"answer": (Record, AlinGo-Prompt.OutputField())})
+    expected = Record(pair=pair)
+    adapter = XMLAdapter(use_json_adapter_fallback=False)
+    wire = adapter.format_assistant_message_content(signature, {"answer": expected})
+    if compact:
+        wire = wire.replace("\n", "")
+    lm = recording_lm([wire])
+    with AlinGo-Prompt.context(lm=lm, adapter=adapter):
+        assert AlinGo-Prompt.Predict(signature)().answer == expected
+    assert len(lm.engine.requests) == 1
+
+
+def test_xml_adapter_positional_tuple_schema_and_validation():
+    class Record(pydantic.BaseModel):
+        pair: tuple[str, list[int]]
+
+    signature = AlinGo-Prompt.Signature({"answer": (Record, AlinGo-Prompt.OutputField())})
+    adapter = XMLAdapter()
+    wire = "<answer><pair><item>tag</item><item><item>2</item><item>3</item></item></pair></answer>"
+    assert adapter.parse(signature, wire)["answer"] == Record(pair=("tag", [2, 3]))
+    assert "<pair>\n<item>\n...\n</item>\n<item>\n<item>\n...\n</item>\n</item>\n</pair>" in adapter.format_field_structure(signature)
+    for invalid in [wire.replace("<item>tag</item>", ""), wire.replace("</pair>", "<item>extra</item></pair>")]:
+        with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+            adapter.parse(signature, invalid)
+
+
+@pytest.mark.anyio
+async def test_xml_adapter_repeated_tuple_fields_preserve_following_stream():
+    class Left(pydantic.BaseModel):
+        name: str
+        count: int
+
+    class Record(pydantic.BaseModel):
+        pair: tuple[Left, str]
+
+    signature = AlinGo-Prompt.Signature({"record": (Record, AlinGo-Prompt.OutputField()), "answer": (str, AlinGo-Prompt.OutputField())})
+    wire = "<record><pair><name>a</name><count>1</count></pair><pair>tail</pair></record><answer>right</answer>"
+    program = AlinGo-Prompt.streamify(AlinGo-Prompt.Predict(signature), stream_listeners=[AlinGo-Prompt.streaming.StreamListener("answer")])
+    with AlinGo-Prompt.context(lm=recording_lm([wire]), adapter=XMLAdapter(use_json_adapter_fallback=False)):
+        chunks = [chunk async for chunk in program()]
+    assert chunks[-1].record == Record(pair=(Left(name="a", count=1), "tail"))
+    assert chunks[-1].answer == "right"
+    assert "".join(chunk.chunk for chunk in chunks if isinstance(chunk, AlinGo-Prompt.streaming.StreamResponse)) == "right"
+
+
+def test_xml_adapter_positional_tuple_preserves_literal_closing_tag():
+    signature = AlinGo-Prompt.Signature({"answer": (list[tuple[str, str]], AlinGo-Prompt.OutputField())})
+    expected = [("before\n</item>\n<b>\nafter\n</b>", "tail")]
+    adapter = XMLAdapter()
+    wire = adapter.format_assistant_message_content(signature, {"answer": expected})
+    assert adapter.parse(signature, wire)["answer"] == expected
+
+
+def test_xml_adapter_parse_multiple_fields():
+    class TestSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        explanation: str = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    completion = """
+<answer>Paris</answer>
+<explanation>The capital of France is Paris.</explanation>
+"""
+    parsed = adapter.parse(TestSignature, completion)
+    assert parsed == {"answer": "Paris", "explanation": "The capital of France is Paris."}
+
+
+def test_xml_adapter_parse_raises_on_missing_field():
+    class TestSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        explanation: str = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    completion = "<answer>Paris</answer>"
+    with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError) as e:
+        adapter.parse(TestSignature, completion)
+    assert e.value.adapter_name == "XMLAdapter"
+    assert e.value.signature == TestSignature
+    assert e.value.lm_response == "<answer>Paris</answer>"
+    assert "explanation" in str(e.value)
+
+
+def test_xml_adapter_parse_casts_types():
+    class TestSignature(AlinGo-Prompt.Signature):
+        number: int = AlinGo-Prompt.OutputField()
+        flag: bool = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    completion = """
+<number>42</number>
+<flag>true</flag>
+"""
+    parsed = adapter.parse(TestSignature, completion)
+    assert parsed == {"number": 42, "flag": True}
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+@pytest.mark.parametrize("closing_newline", ["\n", ""])
+@pytest.mark.parametrize("prefix", ["", "<think>Consider <code>wrong</code>.</think>\n", "Here is the code:\n\n"])
+def test_xml_adapter_predict_accepts_literal_code_without_fallback(fenced, closing_newline, prefix):
+    class Generate(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        reasoning: str = AlinGo-Prompt.OutputField()
+        code: str = AlinGo-Prompt.OutputField()
+
+    code = "```python\nif len(page) < 20:\n    print('R&B', '</code>')\n```"
+    completion = f"{prefix}<reasoning>\nKeep R&B tracks\n</reasoning>\n<code>\n{code}{closing_newline}</code>"
+    if fenced:
+        completion = f"```xml\n{completion}\n```"
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as completion_mock:
+        completion_mock.return_value = make_response(
+            completion, model="openai/gpt-4o-mini"
+        )
+        with AlinGo-Prompt.context(
+            lm=AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False),
+            adapter=XMLAdapter(use_json_adapter_fallback=False),
+        ):
+            result = AlinGo-Prompt.Predict(Generate)(question="Write a pagination check")
+    assert result.code == code
+    assert result.reasoning == "Keep R&B tracks"
+    assert completion_mock.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "body, annotation, expected",
+    [
+        ("<answer>Paris</answer>", str, "Paris"),
+        ("<answer>  \r\n    Paris  \r\n </answer>  ", str, "    Paris  "),
+        ("<answer>\n\n</answer>", str, ""),
+        ("<answer/>", str | None, None),
+        ("<answer><item>Paris</item><item>Lyon</item></answer>", list[str], ["Paris", "Lyon"]),
+        ("<answer>\nx = '''\n</answer>\nR&B\n'''\n</answer>", str, "x = '''\n</answer>\nR&B\n'''"),
+        ("```xml\n<answer>\nParis\n</answer>\n```", str, "Paris"),
+    ],
+)
+def test_xml_adapter_predict_ignores_trailing_prose(body, annotation, expected):
+    signature = AlinGo-Prompt.Signature("question -> answer").with_updated_fields("answer", type_=annotation)
+    response = body + "\n\nLet me know if you need anything else."
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete", return_value=make_response(
+        response, model="openai/gpt-4o-mini"
+    )):
+        with AlinGo-Prompt.context(
+            lm=AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False),
+            adapter=XMLAdapter(use_json_adapter_fallback=False),
+        ):
+            assert AlinGo-Prompt.Predict(signature)(question="Name French cities").answer == expected
+
+
+@pytest.mark.parametrize("name", ["think", "thinking"])
+def test_xml_adapter_preserves_declared_thinking_field(name):
+    signature = AlinGo-Prompt.Signature(f"question -> {name}, answer")
+    result = XMLAdapter().parse(signature, f"<{name}>Literal thought</{name}><answer>42</answer>")
+    assert result == {name: "Literal thought", "answer": "42"}
+
+
+@pytest.mark.parametrize("prefix", ["<think>unfinished", "<thinking>unfinished", "<unknown>extra</unknown>"])
+def test_xml_adapter_does_not_ignore_incomplete_reasoning_or_unknown_fields(prefix):
+    with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+        XMLAdapter().parse(AlinGo-Prompt.Signature("question -> answer"), prefix + "<answer>42</answer>")
+
+
+def test_xml_adapter_xml_syntax_is_literal_text():
+    class Result(AlinGo-Prompt.Signature):
+        text: str = AlinGo-Prompt.OutputField()
+
+    value = "<![CDATA[<raw> &amp; &#65;]]>"
+    adapter = XMLAdapter()
+    formatted = adapter.format_assistant_message_content(Result, {"text": value})
+    assert formatted == f"<text>\n{value}\n</text>"
+    assert adapter.parse(Result, formatted) == {"text": value}
+    assert adapter.parse(Result, f"<text>{value}</text>") == {"text": value}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "if x<y: print('</code>', '</item>', 'R&B')",
+        "payload\n</code>\n</item>\n</source>\nmore &amp; text",
+    ],
+)
+def test_xml_adapter_literal_leaves_round_trip_at_every_depth(value):
+    class Program(pydantic.BaseModel):
+        code: str
+        alternatives: list[str]
+        metadata: dict[str, str]
+
+    Labels = TypedDict("Labels", {"first": str, "postal code": str})
+
+    class Result(AlinGo-Prompt.Signature):
+        code: str = AlinGo-Prompt.OutputField()
+        programs: list[Program] = AlinGo-Prompt.OutputField()
+        labels: Labels = AlinGo-Prompt.OutputField()
+
+    expected = {
+        "code": value,
+        "programs": [
+            Program(code=value, alternatives=[value, "second"], metadata={"source": value, "other": "tail"}),
+            Program(code="last", alternatives=[], metadata={}),
+        ],
+        "labels": {"first": "before", "postal code": "after"},
+    }
+    adapter = XMLAdapter()
+    formatted = adapter.format_assistant_message_content(Result, expected)
+    assert adapter.parse(Result, formatted) == expected
+
+
+@pytest.mark.parametrize("case", ["nested_html", "unicode_key", "html_with_extra"])
+def test_xml_predict_round_trips_nested_html_and_unicode_keys(case):
+    class Page(pydantic.BaseModel):
+        model_config = pydantic.ConfigDict(strict=True)
+        html: str
+        name: str
+        count: int = pydantic.Field(alias="count-alias")
+
+    annotation, expected = (
+        (Page, Page(html="<html>Body</html>\n<footer>Copyright</footer>", name="literal <name> opening", **{"count-alias": 2}))
+        if case != "unicode_key"
+        else (dict[str, str], {"cafe\u0301": "decomposed", "café": "precomposed"})
+    )
+    signature = AlinGo-Prompt.Signature({"result": (annotation, AlinGo-Prompt.OutputField())})
+    adapter = XMLAdapter(use_json_adapter_fallback=False)
+    response = adapter.format_assistant_message_content(signature, {"result": expected})
+    if case == "html_with_extra":
+        response = response.replace("</name>", "</name>\n<extra>ignored</extra>")
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete", return_value=make_response(
+        response, model="openai/gpt-4o-mini"
+    )):
+        with AlinGo-Prompt.context(lm=AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False), adapter=adapter):
+            if case == "html_with_extra":
+                with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+                    AlinGo-Prompt.Predict(signature)()
+                return
+            assert AlinGo-Prompt.Predict(signature)().result == expected
+
+
+@pytest.mark.parametrize("kind", ["cat", "dog"])
+def test_xml_adapter_nested_discriminated_union_round_trip(kind):
+    class Cat(pydantic.BaseModel):
+        kind: Literal["cat"]
+        name: str
+
+    class Dog(pydantic.BaseModel):
+        kind: Literal["dog"]
+        tricks: list[str]
+        nickname: str | None
+
+    class Owner(pydantic.BaseModel):
+        pet: Cat | Dog = pydantic.Field(discriminator="kind")
+
+    class Result(AlinGo-Prompt.Signature):
+        owner: Owner = AlinGo-Prompt.OutputField()
+
+    pet = Cat(kind="cat", name="Milo") if kind == "cat" else Dog(kind="dog", tricks=["sit", "fetch"], nickname=None)
+    expected = {"owner": Owner(pet=pet)}
+    adapter = XMLAdapter()
+    formatted = adapter.format_assistant_message_content(Result, expected)
+    assert adapter.parse(Result, formatted) == expected
+    assert adapter.parse(Result, formatted.replace("\n", "")) == expected
+    with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+        adapter.parse(Result, formatted.replace(f"\n{kind}\n", "\nunknown\n"))
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_xml_adapter_html_round_trip_with_same_named_ancestors(newline):
+    class Page(pydantic.BaseModel):
+        html: str
+
+    class Result(AlinGo-Prompt.Signature):
+        html: Page = AlinGo-Prompt.OutputField()
+        pages: list[Page] = AlinGo-Prompt.OutputField()
+        count: int = AlinGo-Prompt.OutputField()
+
+    page = newline.join(["<!DOCTYPE html>", "<html><body>R&B &amp; 雪</body>", "</html>"])
+    expected = {"html": Page(html=page), "pages": [Page(html=page), Page(html="second")], "count": 2}
+    adapter = XMLAdapter()
+    formatted = adapter.format_assistant_message_content(Result, expected)
+    assert adapter.parse(Result, formatted) == expected
+
+
+@pytest.mark.parametrize(
+    "completion, expected",
+    [
+        ("<code>x</code></code>", "x</code>"),
+        ("<code>\nx\n</code>\nsurplus\n</code>", "x\n</code>\nsurplus"),
+        ("<code>print('</code>')</code>", "print('</code>')"),
+    ],
+)
+def test_xml_adapter_recovers_literal_closing_tags(completion, expected):
+    assert XMLAdapter().parse(AlinGo-Prompt.Signature("-> code"), completion) == {"code": expected}
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_xml_adapter_nested_tag_lines_preserve_literal_payload(newline):
+    class Program(pydantic.BaseModel):
+        code: str
+        checks: list[str]
+
+    class Result(AlinGo-Prompt.Signature):
+        program: Program = AlinGo-Prompt.OutputField()
+
+    code = f"    if n < 20:{newline}        print('</code> &amp;')  "
+    completion = newline.join(
+        [
+            "<program>",
+            "  <code>",
+            code,
+            "  </code>",
+            "  <checks>",
+            "    <item>",
+            "print('</item>')",
+            "    </item>",
+            "    <item>",
+            "R&B",
+            "    </item>",
+            "  </checks>",
+            "</program>",
+        ]
+    )
+    assert XMLAdapter().parse(Result, completion) == {"program": Program(code=code, checks=["print('</item>')", "R&B"])}
+
+
+@pytest.mark.parametrize(
+    "completion",
+    [
+        "<code>unterminated",
+        "<code>x</wrong>",
+        "<code>x</code><code>y</code>",
+        "<code>x</code><unknown>y</unknown>",
+        '<entry key="code">x</entry>',
+        "<code>x</code><counts><item>2</counts>",
+        "<code>x</code><counts>bad</counts></code>",
+        "<code>x</code>Thanks! <unknown>extra</unknown>",
+        "<code>x</code><counts><item>2</counts>Thanks!",
+    ],
+)
+def test_xml_adapter_validates_outer_fields_and_structured_nesting(completion):
+    class Result(AlinGo-Prompt.Signature):
+        code: str = AlinGo-Prompt.OutputField()
+        counts: list[int] = AlinGo-Prompt.OutputField(default=[])
+
+    with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+        XMLAdapter().parse(Result, completion)
+
+
+def test_xml_adapter_nullable_scalar_cannot_repeat():
+    class Result(AlinGo-Prompt.Signature):
+        text: str | None = AlinGo-Prompt.OutputField()
+
+    assert XMLAdapter().parse(Result, "<text />") == {"text": None}
+    with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+        XMLAdapter().parse(Result, "<text /><text />")
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_xml_adapter_nullable_text_round_trip_distinguishes_empty_from_null(value):
+    class Result(AlinGo-Prompt.Signature):
+        text: str | None = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    formatted = adapter.format_assistant_message_content(Result, {"text": value})
+    assert adapter.parse(Result, formatted) == {"text": value}
+    assert adapter.parse(Result, "<text>\n\n</text>") == {"text": ""}
+    prompt = adapter.format(Result, [], {})
+    assert prompt.system.split("Output format (replace placeholders):\n")[1].startswith(
+        "<text>\n{text}\n</text>\n"
+    )
+    assert prompt.messages[-1].text == (
+        "Output format (replace placeholders):\n<text>\n{text}\n</text>\n\n"
+        "Use this format for text outputs. Put field tags on separate lines. "
+        "Write string values literally, without XML or JSON escaping."
+        " For null, self-close the field's own tag. For an empty string, use an opening and closing tag with no content."
+    )
+    assert "JSON" not in prompt.system
+
+
+@pytest.mark.parametrize("values", [None, [], ["", None, "R&B"]])
+def test_xml_adapter_nullable_containers_round_trip(values):
+    class Result(AlinGo-Prompt.Signature):
+        values: list[str | None] | None = AlinGo-Prompt.OutputField()
+        mapping: dict[str, str | None] | None = AlinGo-Prompt.OutputField()
+        missing: None = AlinGo-Prompt.OutputField()
+
+    expected = {
+        "values": values,
+        "mapping": None if values is None else {str(i): value for i, value in enumerate(values)},
+        "missing": None,
+    }
+    adapter = XMLAdapter()
+    formatted = adapter.format_assistant_message_content(Result, expected)
+    assert adapter.parse(Result, formatted) == expected
+
+
+def test_xml_adapter_concise_prompt_preserves_type_guidance_and_dictionary_keys():
+    from enum import Enum
+    from typing import Any
+
+    class Choice(Enum):
+        YES = "yes"
+        NO = "no"
+
+    class Result(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        scalar: int | str = AlinGo-Prompt.OutputField()
+        choice: Choice = AlinGo-Prompt.OutputField()
+        pair: tuple[str, int] = AlinGo-Prompt.OutputField()
+        metadata: dict[str, Any] = AlinGo-Prompt.OutputField()
+
+    prompt = XMLAdapter().format(Result, [], {"question": "Choose"})
+    structure = prompt.system.split("Output format (replace placeholders):\n")[1]
+    assert "<question>" not in structure
+    assert "<scalar>\n{scalar}\n</scalar>" in structure
+    assert "{choice}        # note: the value you produce must be one of: yes; no" in structure
+    assert "{pair}        # note: the value you produce must adhere to the JSON schema:" in structure
+    assert "<metadata>\n...\n</metadata>" in structure
+    assert "Output format (replace placeholders):\n" in prompt.messages[-1].text
+    assert "<metadata>\n...\n</metadata>" in prompt.messages[-1].text
+    assert prompt.messages[-1].text.endswith(
+        "Use this format for text outputs. Put field tags on separate lines. "
+        "Write string values literally, without XML or JSON escaping."
+        ' Dictionary keys: <entry key="...">; escape key attributes only.'
+    )
+
+
+def test_xml_adapter_nested_enum_and_literal_constraints_in_prompt():
+    from enum import Enum
+
+    class Priority(Enum):
+        LOW = "low"
+        HIGH = "high"
+
+    class Item(pydantic.BaseModel):
+        kind: Literal["ticket"]
+        label: Literal["question", "complaint", "praise"]
+        priority: Priority | None
+        urgent: Literal[False]
+
+    class Result(AlinGo-Prompt.Signature):
+        items: list[Item] = AlinGo-Prompt.OutputField()
+
+    prompt = XMLAdapter().format(Result, [], {})
+    for text in (prompt.system, prompt.messages[-1].text):
+        assert "<kind>\nticket\n</kind>" in text
+        assert "<label>\none of: question; complaint; praise\n</label>" in text
+        assert "<priority>\none of: low; high\n</priority>" in text
+        assert "<urgent>\nFalse\n</urgent>" in text
+
+
+def test_xml_adapter_structured_union_uses_structural_tag_lines():
+    class Person(pydantic.BaseModel):
+        name: str
+        age: int
+
+    class Result(AlinGo-Prompt.Signature):
+        person: str | Person = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    body = "<name>Ada</name><age>not an integer</age>"
+    with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+        adapter.parse(Result, f"<person>{body}</person>")
+    with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+        adapter.parse(Result, "<person>\n<name>\nAda\n</name>\n<age>\nbad\n</age>\n</person>")
+    assert adapter.parse(Result, f"<person>\n{body}\n</person>") == {"person": body}
+    assert adapter.parse(Result, adapter.format_assistant_message_content(Result, {"person": body})) == {"person": body}
+    assert adapter.parse(Result, "<person><name>Ada</name><age>36</age></person>") == {
+        "person": Person(name="Ada", age=36)
+    }
+    assert adapter.parse(Result, "<person>\n<name>\n<unfinished>\n</name>\n<age>\n36\n</age>\n</person>") == {
+        "person": Person(name="<unfinished>", age=36)
+    }
+
+
+def test_xml_adapter_parse_raises_on_type_error():
+    class TestSignature(AlinGo-Prompt.Signature):
+        number: int = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    completion = "<number>not_a_number</number>"
+    with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError) as e:
+        adapter.parse(TestSignature, completion)
+    assert "Failed to parse field" in str(e.value)
+
+
+def test_xml_adapter_repeated_dict_elements_and_empty_lists():
+    class TestSignature(AlinGo-Prompt.Signature):
+        counts: dict[str, list[int]] = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    assert '<entry key="example key">\n<item>\n...\n</item>\n</entry>' in (
+        adapter.format_field_structure(TestSignature)
+    )
+    completion = "<counts><first>3</first><first>4</first><second>5</second></counts>"
+    assert adapter.parse(TestSignature, completion) == {
+        "counts": {"first": [3, 4], "second": [5]},
+    }
+    assert adapter.parse(TestSignature, "<counts>\n<first><item>3</item><item>4</item></first>\n</counts>") == {
+        "counts": {"first": [3, 4]},
+    }
+
+    counts = {"postal code": [3, 4], 'quoted "key" & more': [5], "line\nbreak": [6], "-status": [7], ".status": [8]}
+    field = FieldInfoWithName(name="counts", info=TestSignature.output_fields["counts"])
+    formatted = adapter.format_field_with_value({field: counts})
+    assert '<entry key="postal code">\n<item>\n3\n</item>\n<item>\n4\n</item>\n</entry>' in formatted
+    assert adapter.parse(TestSignature, formatted) == {"counts": counts}
+    assert adapter.parse(TestSignature, "<counts />") == {"counts": {}}
+
+    class EmptySignature(AlinGo-Prompt.Signature):
+        items: list[str] = AlinGo-Prompt.OutputField()
+
+    assert adapter.parse(EmptySignature, "<items>\n<item>Q7-194</item>\n<item>M2-863</item>\n</items>") == {
+        "items": ["Q7-194", "M2-863"],
+    }
+
+    field = FieldInfoWithName(name="items", info=EmptySignature.output_fields["items"])
+    assert adapter.format_field_with_value({field: []}) == "<items>\n\n</items>"
+    assert adapter.parse(EmptySignature, "<items />") == {"items": []}
+
+
+def test_xml_adapter_uses_pydantic_field_names_as_xml_tags():
+    class Address(pydantic.BaseModel):
+        postal_code: str = pydantic.Field(alias="postal code")
+        country_code: str = pydantic.Field(alias="country-code")
+
+    class TestSignature(AlinGo-Prompt.Signature):
+        address: Address = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    address = Address(**{"postal code": "94305", "country-code": "US"})
+    xml = adapter.format_assistant_message_content(TestSignature, {"address": address})
+
+    assert xml == "<address>\n<postal_code>\n94305\n</postal_code>\n<country_code>\nUS\n</country_code>\n</address>"
+    assert "<address>\n<postal_code>\n...\n</postal_code>\n<country_code>\n...\n</country_code>\n</address>" in (
+        adapter.format_field_structure(TestSignature)
+    )
+    assert adapter.parse(TestSignature, xml) == {"address": address}
+
+
+def test_xml_adapter_typed_dict_schema_and_parsing():
+    class Address(TypedDict):
+        city: str
+
+    class Order(TypedDict):
+        order_id: int
+        address: Address | None
+        labels: list[str]
+
+    class TestSignature(AlinGo-Prompt.Signature):
+        order: Order = AlinGo-Prompt.OutputField()
+        orders: list[Order] = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    order_schema = (
+        "<order>\n<order_id>\n...\n</order_id>\n<address>\n<city>\n...\n</city>\n</address>\n"
+        "<labels>\n<item>\n...\n</item>\n</labels>\n</order>"
+    )
+    orders_schema = (
+        "<orders>\n<item>\n<order_id>\n...\n</order_id>\n<address>\n<city>\n...\n</city>\n</address>\n"
+        "<labels>\n<item>\n...\n</item>\n</labels>\n</item>\n</orders>"
+    )
+    system_instructions = adapter.format_field_structure(TestSignature)
+    assert f"{order_schema}\n\n{orders_schema}" in system_instructions
+    assert adapter.user_message_output_requirements(TestSignature) == (
+        f"Output format (replace placeholders):\n{order_schema}\n\n{orders_schema}\n\n"
+        "Use this format for text outputs. Put field tags on separate lines. "
+        "Write string values literally, without XML or JSON escaping."
+        " For null, self-close the field's own tag. For an empty string, use an opening and closing tag with no content."
+    )
+
+    completion = (
+        "<order><order_id>1</order_id><address><city>London</city></address><labels>new</labels></order>"
+        "<orders><order_id>2</order_id><address><city>Paris</city></address><labels>paid</labels></orders>"
+    )
+    assert adapter.parse(TestSignature, completion) == {
+        "order": {"order_id": 1, "address": {"city": "London"}, "labels": ["new"]},
+        "orders": [{"order_id": 2, "address": {"city": "Paris"}, "labels": ["paid"]}],
+    }
+
+
+def test_xml_adapter_parses_nullable_and_structured_union_fields():
+    class Profile(pydantic.BaseModel):
+        name: str
+
+    class Details(TypedDict):
+        label: str
+
+    class First(pydantic.BaseModel):
+        count: int
+
+    class Second(pydantic.BaseModel):
+        labels: list[str]
+
+    class FirstDict(TypedDict):
+        count: int
+
+    class SecondDict(TypedDict):
+        labels: list[str]
+
+    class NumberList(pydantic.BaseModel):
+        value: list[int]
+
+    class TextValue(pydantic.BaseModel):
+        value: str
+
+    class ScalarLabels(pydantic.BaseModel):
+        labels: str
+
+    class ListLabels(pydantic.BaseModel):
+        labels: list[str]
+
+    class Envelope(pydantic.BaseModel):
+        choice: ScalarLabels | ListLabels
+
+    class StringFirstEnvelope(pydantic.BaseModel):
+        child: str | ListLabels
+
+    class TestSignature(AlinGo-Prompt.Signature):
+        text: str | None = AlinGo-Prompt.OutputField()
+        profile: Profile | None = AlinGo-Prompt.OutputField()
+        details: Details | None = AlinGo-Prompt.OutputField()
+        model: First | Second = AlinGo-Prompt.OutputField()
+        mapping: FirstDict | SecondDict = AlinGo-Prompt.OutputField()
+        tied: NumberList | TextValue = AlinGo-Prompt.OutputField()
+        nested: Envelope = AlinGo-Prompt.OutputField()
+        string_first: StringFirstEnvelope = AlinGo-Prompt.OutputField()
+
+    completion = (
+        "<text /><profile /><details />"
+        "<model><labels>one</labels><labels>two</labels></model>"
+        "<mapping><labels>three</labels></mapping>"
+        "<tied><value>later-branch-text</value></tied>"
+        "<nested><choice><labels>first</labels><labels>second</labels></choice></nested>"
+        "<string_first><child><labels>one</labels><labels>two</labels></child></string_first>"
+    )
+    assert XMLAdapter().parse(TestSignature, completion) == {
+        "text": None,
+        "profile": None,
+        "details": None,
+        "model": Second(labels=["one", "two"]),
+        "mapping": {"labels": ["three"]},
+        "tied": TextValue(value="later-branch-text"),
+        "nested": Envelope(choice=ListLabels(labels=["first", "second"])),
+        "string_first": StringFirstEnvelope(child=ListLabels(labels=["one", "two"])),
+    }
+
+
+def test_xml_adapter_recursive_model_schema_terminates():
+    class Node(pydantic.BaseModel):
+        value: str
+        children: list["Node"]
+
+    class TestSignature(AlinGo-Prompt.Signature):
+        root: Node = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    assert "<root>\n<value>\n...\n</value>\n<children>\n<item>\n...\n</item>\n</children>\n</root>" in (
+        adapter.format_field_structure(TestSignature)
+    )
+    completion = "<root><value>parent</value><children><value>child</value><children /></children></root>"
+    assert adapter.parse(TestSignature, completion) == {
+        "root": Node(value="parent", children=[Node(value="child", children=[])])
+    }
+
+
+def test_xml_adapter_format_and_parse_nested_model():
+    class Address(pydantic.BaseModel):
+        city: str
+
+    class InnerModel(pydantic.BaseModel):
+        value: int
+        label: str
+        address: Address
+
+    class TestSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        result: InnerModel = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    # Format output fields as XML
+    result = InnerModel(value=5, label="foo", address=Address(city="London"))
+    fields_with_values = {FieldInfoWithName(name="result", info=TestSignature.output_fields["result"]): result}
+    xml = adapter.format_field_with_value(fields_with_values)
+    assert xml == "<result>\n<value>\n5\n</value>\n<label>\nfoo\n</label>\n<address>\n<city>\nLondon\n</city>\n</address>\n</result>"
+    assert adapter.parse(TestSignature, xml) == {"result": result}
+
+    # Legacy JSON values inside the outer XML field remain supported.
+    completion = '<result>{"value": 5, "label": "foo", "address": {"city": "London"}}</result>'
+    parsed = adapter.parse(TestSignature, completion)
+    assert parsed == {"result": result}
+
+
+def test_xml_adapter_format_and_parse_list_of_models():
+    class Item(pydantic.BaseModel):
+        name: str
+        score: float
+
+    class TestSignature(AlinGo-Prompt.Signature):
+        items: list[Item] = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    items = [Item(name="a", score=1.1), Item(name="b", score=2.2)]
+    fields_with_values = {FieldInfoWithName(name="items", info=TestSignature.output_fields["items"]): items}
+    xml = adapter.format_field_with_value(fields_with_values)
+    assert xml == (
+        "<items>\n<item>\n<name>\na\n</name>\n<score>\n1.1\n</score>\n</item>\n"
+        "<item>\n<name>\nb\n</name>\n<score>\n2.2\n</score>\n</item>\n</items>"
+    )
+    assert adapter.parse(TestSignature, xml) == {"items": items}
+    # XML structure follows the declared fields, not Pydantic's extra-ignore policy.
+    for count in (1, 2):
+        with_extra = xml.replace("</name>", "</name>\n<extra>ignored</extra>", count)
+        with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+            adapter.parse(TestSignature, with_extra)
+
+    # Legacy JSON lists inside the outer XML field remain supported.
+    import json
+
+    completion = f"<items>{json.dumps([i.model_dump() for i in items])}</items>"
+    assert adapter.parse(TestSignature, completion) == {"items": items}
+
+
+def test_xml_adapter_with_tool_like_output():
+    # XMLAdapter does not natively support tool calls, but we can test structured output
+    class ToolCall(pydantic.BaseModel):
+        name: str
+        args: dict
+        result: str
+
+    class TestSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tool_calls: list[ToolCall] = AlinGo-Prompt.OutputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    tool_calls = [
+        ToolCall(name="get_weather", args={"city": "Tokyo"}, result="Sunny"),
+        ToolCall(name="get_population", args={"country": "Japan", "year": 2023}, result="125M"),
+    ]
+    fields_with_values = {
+        FieldInfoWithName(name="tool_calls", info=TestSignature.output_fields["tool_calls"]): tool_calls,
+        FieldInfoWithName(
+            name="answer", info=TestSignature.output_fields["answer"]
+        ): "The weather is Sunny. Population is 125M.",
+    }
+    xml = adapter.format_field_with_value(fields_with_values)
+    assert xml.strip().startswith("<tool_calls>")
+    assert "<name>\nget_weather\n</name>" in xml
+    assert "<result>\n125M\n</result>" in xml
+    assert xml.strip().endswith("</answer>")
+
+    import json
+
+    completion = (
+        f"<tool_calls>{json.dumps([tc.model_dump() for tc in tool_calls])}</tool_calls>"
+        f"\n<answer>The weather is Sunny. Population is 125M.</answer>"
+    )
+    parsed = adapter.parse(TestSignature, completion)
+    assert isinstance(parsed["tool_calls"], list)
+    assert parsed["tool_calls"][0].name == "get_weather"
+    assert parsed["tool_calls"][1].result == "125M"
+    assert parsed["answer"] == "The weather is Sunny. Population is 125M."
+
+
+def test_xml_adapter_formats_nested_images():
+    class ImageWrapper(pydantic.BaseModel):
+        images: list[AlinGo-Prompt.Image]
+        tag: list[str]
+
+    class MySignature(AlinGo-Prompt.Signature):
+        image: ImageWrapper = AlinGo-Prompt.InputField()
+        text: str = AlinGo-Prompt.OutputField()
+
+    image1 = AlinGo-Prompt.Image(url="https://example.com/image1.jpg")
+    image2 = AlinGo-Prompt.Image(url="https://example.com/image2.jpg")
+    image3 = AlinGo-Prompt.Image(url="https://example.com/image3.jpg")
+
+    image_wrapper = ImageWrapper(images=[image1, image2, image3], tag=["test", "example"])
+    demos = [
+        AlinGo-Prompt.Example(
+            image=image_wrapper,
+            text="This is a test image",
+        ),
+    ]
+
+    image_wrapper_2 = ImageWrapper(images=[AlinGo-Prompt.Image(url="https://example.com/image4.jpg")], tag=["test", "example"])
+    adapter = AlinGo-Prompt.XMLAdapter()
+    messages = adapter.format(MySignature, demos, {"image": image_wrapper_2}).messages
+
+    assert len(messages) == 3
+
+    # Image information in the few-shot example's user message
+    from AlinGo-Prompt.lm15 import ImagePart
+
+    assert ImagePart(url="https://example.com/image1.jpg", media_type="image/jpeg") in messages[0].parts
+    assert ImagePart(url="https://example.com/image2.jpg", media_type="image/jpeg") in messages[0].parts
+    assert ImagePart(url="https://example.com/image3.jpg", media_type="image/jpeg") in messages[0].parts
+
+    # The query image is formatted in the last user message
+    assert ImagePart(url="https://example.com/image4.jpg", media_type="image/jpeg") in messages[-1].parts
+
+
+def test_xml_adapter_with_code():
+    # Test with code as input field
+    class CodeAnalysis(AlinGo-Prompt.Signature):
+        """Analyze the time complexity of the code"""
+
+        code: AlinGo-Prompt.Code = AlinGo-Prompt.InputField()
+        result: str = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.XMLAdapter()
+    prompt = adapter.format(CodeAnalysis, [], {"code": "print('Hello, world!')"})
+
+    assert len(prompt.messages) == 1
+
+    # The output field type description should be included in the system message even if the output field is nested
+    assert AlinGo-Prompt.Code.description() in prompt.system
+
+    # The user message should include the question and the tools
+    assert "print('Hello, world!')" in prompt.messages[0].text
+
+    # Test with code as output field
+    class CodeGeneration(AlinGo-Prompt.Signature):
+        """Generate code to answer the question"""
+
+        question: str = AlinGo-Prompt.InputField()
+        code: AlinGo-Prompt.Code = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.XMLAdapter()
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        mock_completion.return_value = make_response(
+            '<code>print("Hello, world!")</code>',
+            model="openai/gpt-4o-mini",
+        )
+        result = adapter(
+            AlinGo-Prompt.LM(model="openai/gpt-4o-mini", cache=False),
+            {},
+            CodeGeneration,
+            [],
+            {"question": "Write a python program to print 'Hello, world!'"},
+        )
+        assert result[0]["code"].code == 'print("Hello, world!")'
+
+
+def test_xml_adapter_full_prompt():
+    class QA(AlinGo-Prompt.Signature):
+        query: str = AlinGo-Prompt.InputField()
+        context: str | None = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.XMLAdapter()
+    prompt = adapter.format(QA, [], {"query": "when was Marie Curie born"})
+
+    assert len(prompt.messages) == 1
+    assert prompt.messages[0].role == "user"
+
+    union_type_repr = "Union[str, NoneType]"
+
+    expected_system = (
+        "Your input fields are:\n"
+        "1. `query` (str): \n"
+        f"2. `context` ({union_type_repr}):\n"
+        "Your output fields are:\n"
+        "1. `answer` (str):\n"
+        "Output format (replace placeholders):\n"
+        "<answer>\n{answer}\n</answer>\n"
+        "In adhering to this structure, your objective is: \n"
+        "        Given the fields `query`, `context`, produce the fields `answer`."
+    )
+
+    expected_user = (
+        "<query>\nwhen was Marie Curie born\n</query>\n\n"
+        "Output format (replace placeholders):\n<answer>\n{answer}\n</answer>\n\n"
+        "Use this format for text outputs. Put field tags on separate lines. "
+        "Write string values literally, without XML or JSON escaping."
+    )
+
+    assert prompt.system == expected_system
+    assert prompt.messages[0].text == expected_user
+
+
+def test_xml_adapter_native_only_outputs_do_not_request_text_fields():
+    class NativeLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_function_calling(self):
+            return True
+
+        @property
+        def supports_reasoning(self):
+            return True
+
+    def search(query: str) -> str:
+        return query
+
+    class Agent(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        thought: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        XMLAdapter(use_native_function_calling=True),
+        Agent,
+        [],
+        {"question": "Find cats", "tools": [AlinGo-Prompt.Tool(search)]},
+        lm=NativeLM([{}]),
+    )
+    assert messages[-1]["content"] == "<question>\nFind cats\n</question>"
+    assert "Output format" not in messages[0]["content"]
+    assert lm_kwargs["tools"][0]["function"]["name"] == "search"
+    assert lm_kwargs["reasoning_effort"] == "low"
+
+
+def test_xml_adapter_format_exact_messages_for_simple_signature():
+    class StringSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.XMLAdapter(),
+        StringSignature,
+        demos=[],
+        inputs={"question": "why did a chicken cross the kitchen?"},
+    )
+
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+    assert messages == [
+        {
+            "role": "system",
+            "content": """Your input fields are:
+1. `question` (str):
+Your output fields are:
+1. `answer` (str):
+Output format (replace placeholders):
+<answer>
+{answer}
+</answer>
+In adhering to this structure, your objective is:\x20
+        Given the fields `question`, produce the fields `answer`.""",
+        },
+        {
+            "role": "user",
+            "content": """<question>
+why did a chicken cross the kitchen?
+</question>
+
+Output format (replace placeholders):
+<answer>
+{answer}
+</answer>
+
+Use this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping.""",
+        },
+    ]
+
+
+def test_xml_adapter_format_exact_non_native_tool_result_history_field():
+    def search(query: str) -> str:
+        return query
+
+    class ToolHistorySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        next_thought: str = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    tool_call = AlinGo-Prompt.ToolCalls.ToolCall(id="call_1", name="search", args={"query": "cats"})
+    tool_call_results = AlinGo-Prompt.ToolCallResults.from_tool_calls_and_values([tool_call], ["cat"])
+
+    messages, _lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.XMLAdapter(use_native_function_calling=False),
+        ToolHistorySignature,
+        [],
+        {
+            "question": "Q2",
+            "history": AlinGo-Prompt.History(
+                messages=[
+                    {
+                        "question": "Q1",
+                        "next_thought": "I should search.",
+                        "tool_calls": AlinGo-Prompt.ToolCalls(tool_calls=[tool_call], tool_call_results=tool_call_results),
+                    }
+                ]
+            ),
+            "tools": [AlinGo-Prompt.Tool(search)],
+        },
+    )
+
+    assert messages[3]["content"] == (
+        "<tool_call_results>\n"
+        '{"tool_call_results": [{"call_id": "call_1", "name": "search", "value": "cat", "is_error": false}]}\n'
+        "</tool_call_results>"
+    )
+    assert messages[4]["content"] == (
+        "<question>\n"
+        "Q2\n"
+        "</question>\n"
+        "\n"
+        "<tools>\n"
+        '["search. It takes arguments {\'query\': {\'type\': \'string\'}}."]\n'
+        "</tools>\n"
+        "\n"
+        "Output format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n"
+        "<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: "
+        '{"type": "object", "$defs": {"ToolCall": {"type": "object", "properties": {"args": '
+        '{"type": "object", "additionalProperties": true, "title": "Args"}, "name": {"type": "string", '
+        '"title": "Name"}}, "required": ["name", "args"], "title": "ToolCall"}}, "properties": '
+        '{"tool_calls": {"type": "array", "items": {"$ref": "#/$defs/ToolCall"}, "title": "Tool Calls"}}, '
+        '"required": ["tool_calls"], "title": "ToolCalls"}\n</tool_calls>\n\n'
+        "Use this format for text outputs. Put field tags on separate lines. "
+        "Write string values literally, without XML or JSON escaping."
+    )
+
+
+def test_xml_adapter_format_exact_messages_for_two_input_signature():
+    class StringSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.InputField()
+        judgement: str = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.XMLAdapter(),
+        StringSignature,
+        demos=[],
+        inputs={"question": "why did a chicken cross the kitchen?", "answer": "To get to the other side!"},
+    )
+
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+    assert messages == [
+        {
+            "role": "system",
+            "content": """Your input fields are:
+1. `question` (str):\x20
+2. `answer` (str):
+Your output fields are:
+1. `judgement` (str):
+Output format (replace placeholders):
+<judgement>
+{judgement}
+</judgement>
+In adhering to this structure, your objective is:\x20
+        Given the fields `question`, `answer`, produce the fields `judgement`.""",
+        },
+        {
+            "role": "user",
+            "content": """<question>
+why did a chicken cross the kitchen?
+</question>
+
+<answer>
+To get to the other side!
+</answer>
+
+Output format (replace placeholders):
+<judgement>
+{judgement}
+</judgement>
+
+Use this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping.""",
+        },
+    ]
+
+
+def test_xml_adapter_format_exact_messages_with_demo_and_typed_output():
+    class MultiAnswer(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        score: float = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.XMLAdapter(),
+        MultiAnswer,
+        demos=[{"question": "Q1", "answer": "A1", "score": 0.9}],
+        inputs={"question": "Q2"},
+    )
+
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+    assert messages == [
+        {
+            "role": "system",
+            "content": """Your input fields are:
+1. `question` (str):
+Your output fields are:
+1. `answer` (str):\x20
+2. `score` (float):
+Output format (replace placeholders):
+<answer>
+{answer}
+</answer>
+
+<score>
+{score}
+</score>
+In adhering to this structure, your objective is:\x20
+        Given the fields `question`, produce the fields `answer`, `score`.""",
+        },
+        {"role": "user", "content": """<question>
+Q1
+</question>"""},
+        {
+            "role": "assistant",
+            "content": """<answer>
+A1
+</answer>
+
+<score>
+0.9
+</score>""",
+        },
+        {
+            "role": "user",
+            "content": """<question>
+Q2
+</question>
+
+Output format (replace placeholders):
+<answer>
+{answer}
+</answer>
+
+<score>
+{score}
+</score>
+
+Use this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping.""",
+        },
+    ]
+
+
+def test_xml_adapter_long_history_preserves_turns_and_literals():
+    class Conversation(AlinGo-Prompt.Signature):
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        counts: dict[str, int] = AlinGo-Prompt.OutputField()
+
+    turns = [
+        {
+            "question": f'Turn {i}: preserve <div data-id="{i}">R&B</div>.',
+            "answer": f"<section><p>雪 {i}</p><script>const x = {{n: {i}}};</script></section>",
+            "counts": {"turn": i, "balance": 17 - i},
+        }
+        for i in range(80)
+    ]
+    history = AlinGo-Prompt.History(messages=turns)
+    original = history.model_dump()
+    adapter = XMLAdapter(use_json_adapter_fallback=False)
+    messages, _ = format_messages_and_lm_kwargs(
+        adapter, Conversation, demos=[turns[0]], inputs={"history": history, "question": "Current question"}
+    )
+    assert [m["role"] for m in messages] == ["system"] + ["user", "assistant"] * 81 + ["user"]
+    assert "Current question" in messages[-1]["content"]
+    for turn, user, assistant in zip(turns, messages[3:-1:2], messages[4:-1:2], strict=False):
+        assert user["content"].startswith(f'<question>\n{turn["question"]}\n</question>')
+        assert "<history>" not in user["content"]
+        assert adapter.parse(Conversation, assistant["content"]) == {
+            "answer": turn["answer"], "counts": turn["counts"]
+        }
+    assert history.model_dump() == original
+
+
+def test_xml_adapter_format_exact_messages_with_history_demo_pydantic_tools_and_image():
+    def search(query: str, k: int = 3) -> str:
+        """Search for documents."""
+        return query
+
+    class Location(pydantic.BaseModel):
+        city: str
+        country: str
+
+    class Profile(pydantic.BaseModel):
+        name: str
+        location: Location
+        interests: list[str]
+
+    class AnswerCard(pydantic.BaseModel):
+        answer: str
+        sources: list[str]
+
+    class RichRenderingSignature(AlinGo-Prompt.Signature):
+        """Answer using all supplied context."""
+
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        image: AlinGo-Prompt.Image = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        profile: Profile = AlinGo-Prompt.InputField()
+        question: str = AlinGo-Prompt.InputField()
+        answer: AnswerCard = AlinGo-Prompt.OutputField()
+
+    tool = AlinGo-Prompt.Tool(search)
+    demo_profile = Profile(
+        name="Ada",
+        location=Location(city="London", country="UK"),
+        interests=["math", "machines"],
+    )
+    current_profile = Profile(
+        name="Grace",
+        location=Location(city="Arlington", country="USA"),
+        interests=["compilers", "navy"],
+    )
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "profile": demo_profile,
+                "question": "Who is Ada?",
+                "answer": AnswerCard(answer="Ada is a mathematician.", sources=["memory"]),
+            }
+        ]
+    )
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.XMLAdapter(),
+        RichRenderingSignature,
+        demos=[
+            {
+                "image": AlinGo-Prompt.Image("https://example.com/demo.png"),
+                "tools": [tool],
+                "profile": demo_profile,
+                "question": "What should we mention?",
+                "answer": AnswerCard(answer="Mention analytical engines.", sources=["demo"]),
+            }
+        ],
+        inputs={
+            "history": history,
+            "image": AlinGo-Prompt.Image("https://example.com/current.png"),
+            "tools": [tool],
+            "profile": current_profile,
+            "question": "What should the answer include?",
+        },
+    )
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `history` (History): \n"
+                 "2. `image` (Image): \n"
+                 "3. `tools` (list[Tool]): \n"
+                 "4. `profile` (Profile): \n"
+                 "5. `question` (str):\n"
+                 "Your output fields are:\n"
+                 "1. `answer` (AnswerCard):\n"
+                 "Output format (replace placeholders):\n"
+                 "<answer>\n<answer>\n...\n</answer>\n<sources>\n<item>\n...\n</item>\n</sources>\n</answer>\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Answer using all supplied context."},
+     {"role": "user",
+      "content": [{"type": "text",
+                   "text": "This is an example of the task, though some input or output fields are not "
+                           "supplied.\n"
+                           "\n"
+                           "<image>\n"},
+                  {"type": "image_url", "image_url": {"url": "https://example.com/demo.png"}},
+                  {"type": "text",
+                   "text": '\n'
+                           '</image>\n'
+                           '\n'
+                           '<tools>\n'
+                           '["search, whose description is <desc>Search for documents.</desc>. It '
+                           "takes arguments {'query': {'type': 'string'}, 'k': {'type': 'integer', "
+                           '\'default\': 3}}."]\n'
+                           '</tools>\n'
+                           '\n'
+                           '<profile>\n'
+                           '{"name": "Ada", "location": {"city": "London", "country": "UK"}, '
+                           '"interests": ["math", "machines"]}\n'
+                           '</profile>\n'
+                           '\n'
+                           '<question>\n'
+                           'What should we mention?\n'
+                           '</question>'}]},
+     {"role": "assistant",
+      "content": "<answer>\n<answer>\nMention analytical engines.\n</answer>\n<sources>\n<item>\ndemo\n</item>\n</sources>\n</answer>"},
+     {"role": "user",
+      "content": '<profile>\n'
+                 '{"name": "Ada", "location": {"city": "London", "country": "UK"}, "interests": '
+                 '["math", "machines"]}\n'
+                 '</profile>\n'
+                 '\n'
+                 '<question>\n'
+                 'Who is Ada?\n'
+                 '</question>\n\n'
+                 'Output format (replace placeholders):\n'
+                 '<answer>\n<answer>\n...\n</answer>\n<sources>\n<item>\n...\n</item>\n</sources>\n</answer>\n\n'
+                 'Use this format for text outputs. Put field tags on separate lines. '
+                 'Write string values literally, without XML or JSON escaping.'},
+     {"role": "assistant",
+      "content": "<answer>\n<answer>\nAda is a mathematician.\n</answer>\n<sources>\n<item>\nmemory\n</item>\n</sources>\n</answer>"},
+     {"role": "user",
+      "content": [{"type": "text", "text": "<image>\n"},
+                  {"type": "image_url", "image_url": {"url": "https://example.com/current.png"}},
+                  {"type": "text",
+                   "text": '\n'
+                           '</image>\n'
+                           '\n'
+                           '<tools>\n'
+                           '["search, whose description is <desc>Search for documents.</desc>. It '
+                           "takes arguments {'query': {'type': 'string'}, 'k': {'type': 'integer', "
+                           '\'default\': 3}}."]\n'
+                           '</tools>\n'
+                           '\n'
+                           '<profile>\n'
+                           '{"name": "Grace", "location": {"city": "Arlington", "country": "USA"}, '
+                           '"interests": ["compilers", "navy"]}\n'
+                           '</profile>\n'
+                           '\n'
+                           '<question>\n'
+                           'What should the answer include?\n'
+                           '</question>\n'
+                           '\n'
+                           'Output format (replace placeholders):\n'
+                           '<answer>\n<answer>\n...\n</answer>\n<sources>\n<item>\n...\n</item>\n</sources>\n</answer>\n\n'
+                           'Use this format for text outputs. Put field tags on separate lines. '
+                           'Write string values literally, without XML or JSON escaping.'}]}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+def test_xml_adapter_format_exact_messages_with_nested_pydantic_output():
+    class XmlAddress(pydantic.BaseModel):
+        city: str
+        country: str
+
+    class XmlSummary(pydantic.BaseModel):
+        title: str
+        address: XmlAddress
+
+    class PydanticSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        summary: XmlSummary = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.XMLAdapter(), PydanticSignature, [], {"question": "Summarize"})
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `question` (str):\n"
+                 "Your output fields are:\n"
+                 "1. `summary` (XmlSummary):\n"
+                 "Output format (replace placeholders):\n"
+                 "<summary>\n<title>\n...\n</title>\n<address>\n<city>\n...\n</city>\n<country>\n...\n</country>\n"
+                 "</address>\n</summary>\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `question`, produce the fields `summary`."},
+     {"role": "user",
+      "content": "<question>\n"
+                 "Summarize\n"
+                 "</question>\n"
+                 "\n"
+                 "Output format (replace placeholders):\n"
+                 "<summary>\n<title>\n...\n</title>\n<address>\n<city>\n...\n</city>\n<country>\n...\n</country>\n"
+                 "</address>\n</summary>\n\n"
+                 "Use this format for text outputs. Put field tags on separate lines. "
+                 "Write string values literally, without XML or JSON escaping."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+def test_xml_adapter_format_exact_messages_with_incomplete_demo():
+    class IncompleteDemoSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        context: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        score: float = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.XMLAdapter(),
+        IncompleteDemoSignature,
+        [{"question": "Q1", "answer": "A1"}],
+        {"question": "Q2", "context": "C2"},
+    )
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `question` (str): \n"
+                 "2. `context` (str):\n"
+                 "Your output fields are:\n"
+                 "1. `answer` (str): \n"
+                 "2. `score` (float):\n"
+                 "Output format (replace placeholders):\n"
+                 "<answer>\n"
+                 "{answer}\n"
+                 "</answer>\n"
+                 "\n"
+                 "<score>\n"
+                 "{score}\n"
+                 "</score>\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `question`, `context`, produce the fields `answer`, "
+                 "`score`."},
+     {"role": "user",
+      "content": "This is an example of the task, though some input or output fields are not "
+                 "supplied.\n"
+                 "\n"
+                 "<question>\n"
+                 "Q1\n"
+                 "</question>"},
+     {"role": "assistant",
+      "content": "<answer>\n"
+                 "A1\n"
+                 "</answer>\n"
+                 "\n"
+                 "<score>\n"
+                 "Not supplied for this particular example. \n"
+                 "</score>"},
+     {"role": "user",
+      "content": "<question>\n"
+                 "Q2\n"
+                 "</question>\n"
+                 "\n"
+                 "<context>\n"
+                 "C2\n"
+                 "</context>\n"
+                 "\n"
+                 "Output format (replace placeholders):\n<answer>\n{answer}\n</answer>\n\n"
+                 "<score>\n{score}\n</score>\n\n"
+                 "Use this format for text outputs. Put field tags on separate lines. "
+                 "Write string values literally, without XML or JSON escaping."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+def test_xml_adapter_format_messages_and_lm_kwargs_with_repl_history_non_reasoning_lm():
+    class NonReasoningLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_reasoning(self):
+            return False
+
+    class REPLHistorySignature(AlinGo-Prompt.Signature):
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        variables_info: str = AlinGo-Prompt.InputField()
+        reasoning: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        code: str = AlinGo-Prompt.OutputField()
+
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "variables_info": "INFO_1",
+                "repl_entry": REPLEntry(
+                    reasoning="First explore the data",
+                    code="x = 10\nprint(f'x = {x}')",
+                    output="x = 20",
+                    max_output_chars=100,
+                ),
+            }
+        ]
+    )
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.XMLAdapter(),
+        REPLHistorySignature,
+        [],
+        {"variables_info": "INFO_2", "history": history},
+        lm=NonReasoningLM([{}]),
+    )
+
+    assert messages[1]["role"] == "user"
+    assert "INFO_1" in messages[1]["content"]
+    assert messages[2] == {
+        "role": "assistant",
+        "content": "<reasoning>\nFirst explore the data\n</reasoning>\n\n<code>\nx = 10\nprint(f'x = {x}')\n</code>",
+    }
+    assert messages[3] == {
+        "role": "user",
+        "content": "<repl_output>\nx = 20\n</repl_output>",
+    }
+    assert messages[4]["role"] == "user"
+    assert "INFO_2" in messages[4]["content"]
+    assert "history" not in messages[4]["content"]
+    assert "reasoning_effort" not in lm_kwargs
+
+
+def test_xml_adapter_format_messages_and_lm_kwargs_with_repl_history_reasoning_lm():
+    class ReasoningLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_reasoning(self):
+            return True
+
+    class REPLHistorySignature(AlinGo-Prompt.Signature):
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        variables_info: str = AlinGo-Prompt.InputField()
+        reasoning: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        code: str = AlinGo-Prompt.OutputField()
+
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "variables_info": "INFO_1",
+                "repl_entry": REPLEntry(
+                    reasoning="First explore the data",
+                    code="x = 10\nprint(f'x = {x}')",
+                    output="x = 20",
+                    max_output_chars=100,
+                ),
+            }
+        ]
+    )
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.XMLAdapter(),
+        REPLHistorySignature,
+        [],
+        {"variables_info": "INFO_2", "history": history},
+        lm=ReasoningLM([{}]),
+    )
+
+    assert messages[1]["role"] == "user"
+    assert "INFO_1" in messages[1]["content"]
+    assert messages[2] == {
+        "role": "assistant",
+        "content": "<code>\nx = 10\nprint(f'x = {x}')\n</code>",
+    }
+    assert messages[3] == {
+        "role": "user",
+        "content": "<repl_output>\nx = 20\n</repl_output>",
+    }
+    assert messages[4]["role"] == "user"
+    assert "INFO_2" in messages[4]["content"]
+    assert "history" not in messages[4]["content"]
+    assert "reasoning_effort" in lm_kwargs
+
+
+def test_xml_adapter_format_messages_and_lm_kwargs_with_repl_history_and_truncation():
+    class ReasoningLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_reasoning(self):
+            return True
+
+    class REPLHistorySignature(AlinGo-Prompt.Signature):
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        variables_info: str = AlinGo-Prompt.InputField()
+        reasoning: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        code: str = AlinGo-Prompt.OutputField()
+
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "variables_info": "INFO_1",
+                "repl_entry": REPLEntry(
+                    reasoning="First explore the data",
+                    code="x = 10\nprint(f'x = {x}')",
+                    output="x = 20",
+                    max_output_chars=4,
+                ),
+            }
+        ]
+    )
+
+    messages, _ = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.XMLAdapter(),
+        REPLHistorySignature,
+        [],
+        {"variables_info": "INFO_2", "history": history},
+        lm=ReasoningLM([{}]),
+    )
+
+    assert messages[1]["role"] == "user"
+    assert "INFO_1" in messages[1]["content"]
+    assert messages[2] == {
+        "role": "assistant",
+        "content": "<code>\nx = 10\nprint(f'x = {x}')\n</code>",
+    }
+    assert messages[3] == {
+        "role": "user",
+        "content": "<repl_output>\nx \n\n... (2 characters omitted) ...\n\n20\n</repl_output>",
+    }
+    assert messages[4]["role"] == "user"
+    assert "INFO_2" in messages[4]["content"]
+    assert "history" not in messages[4]["content"]
+
+
+def test_format_system_message():
+    class MySignature(AlinGo-Prompt.Signature):
+        """Answer the question with multiple answers and scores"""
+
+        question: str = AlinGo-Prompt.InputField()
+        answers: list[str] = AlinGo-Prompt.OutputField()
+        scores: list[float] = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.XMLAdapter()
+    system_message = adapter.format_system_message(MySignature)
+
+    expected_system_message = """Your input fields are:
+1. `question` (str):
+Your output fields are:
+1. `answers` (list[str]):\x20
+2. `scores` (list[float]):
+Output format (replace placeholders):
+<answers>
+<item>
+...
+</item>
+</answers>
+
+<scores>
+<item>
+...
+</item>
+</scores>
+In adhering to this structure, your objective is:\x20
+        Answer the question with multiple answers and scores"""
+    assert system_message == expected_system_message
+
+
+def test_xml_adapter_missing_optional_output_fields_fall_back_to_defaults():
+    class TestSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        note: str | None = AlinGo-Prompt.OutputField(default="No note")
+        maybe: str | None = AlinGo-Prompt.OutputField()
+
+    adapter = XMLAdapter()
+    parsed = adapter.parse(TestSignature, "<answer>Paris</answer>")
+    assert parsed == {"answer": "Paris", "note": "No note", "maybe": None}

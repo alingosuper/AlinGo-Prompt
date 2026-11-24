@@ -1,0 +1,19 @@
+# AlinGo-Prompt.disable_litellm_logging
+
+Disable logging for the optional LiteLLM compatibility integration installed with
+`pip install "AlinGo-Prompt[litellm]"`. This is separate from DSPy's own logging and does
+not disable the compatibility engine.
+
+<!-- START_API_REF -->
+::: AlinGo-Prompt.disable_litellm_logging
+    handler: python
+    options:
+        show_source: true
+        show_root_heading: true
+        heading_level: 2
+        docstring_style: google
+        show_root_full_path: true
+        show_object_full_path: false
+        separate_signature: false
+        inherited_members: true
+<!-- END_API_REF -->

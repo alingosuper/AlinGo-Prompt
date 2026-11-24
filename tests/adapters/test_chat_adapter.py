@@ -1,0 +1,3136 @@
+import json
+from typing import Literal
+from unittest import mock
+
+import pydantic
+import pytest
+
+import AlinGo-Prompt
+from AlinGo-Prompt.experimental import Citations, Document, Score
+from AlinGo-Prompt.lm15 import AudioPart, DocumentPart, ImagePart, TextPart
+from AlinGo-Prompt.lm15 import Message as LMMessage
+from AlinGo-Prompt.primitives.repl_types import REPLEntry
+from tests.adapters.conftest import format_messages_and_lm_kwargs, format_request, openai_view
+from tests.test_utils.engines import make_response
+
+
+@pytest.mark.parametrize(
+    "input_literal, output_literal, input_value, expected_input_str, expected_output_str",
+    [
+        # Scenario 1: double quotes escaped within strings
+        (
+            Literal["one", "two", 'three"'],
+            Literal["four", "five", 'six"'],
+            "two",
+            "Literal['one', 'two', 'three\"']",
+            "Literal['four', 'five', 'six\"']",
+        ),
+        # Scenario 2: Single quotes inside strings
+        (
+            Literal["she's here", "okay", "test"],
+            Literal["done", "maybe'soon", "later"],
+            "she's here",
+            "Literal[\"she's here\", 'okay', 'test']",
+            "Literal['done', \"maybe'soon\", 'later']",
+        ),
+        # Scenario 3: Strings containing both single and double quotes
+        (
+            Literal["both\"and'", "another"],
+            Literal["yet\"another'", "plain"],
+            "another",
+            "Literal['both\"and\\'', 'another']",
+            "Literal['yet\"another\\'', 'plain']",
+        ),
+        # Scenario 4: No quotes at all (check the default)
+        (
+            Literal["foo", "bar"],
+            Literal["baz", "qux"],
+            "foo",
+            "Literal['foo', 'bar']",
+            "Literal['baz', 'qux']",
+        ),
+        # Scenario 5: Mixed types
+        (
+            Literal[1, "bar"],
+            Literal[True, 3, "foo"],
+            "bar",
+            "Literal[1, 'bar']",
+            "Literal[True, 3, 'foo']",
+        ),
+    ],
+)
+def test_chat_adapter_quotes_literals_as_expected(
+    input_literal, output_literal, input_value, expected_input_str, expected_output_str
+):
+    """
+    This test verifies that when we declare Literal fields with various mixes
+    of single/double quotes, the generated content string includes those
+    Literals exactly as we want them to appear (like IPython does).
+    """
+
+    class TestSignature(AlinGo-Prompt.Signature):
+        input_text: input_literal = AlinGo-Prompt.InputField()
+        output_text: output_literal = AlinGo-Prompt.OutputField()
+
+    program = AlinGo-Prompt.Predict(TestSignature)
+
+    AlinGo-Prompt.configure(lm=AlinGo-Prompt.LM(model="openai/gpt-4o"), adapter=AlinGo-Prompt.ChatAdapter())
+
+    reply = make_response(f"[[ ## output_text ## ]]\n{output_literal.__args__[0]}\n\n[[ ## completed ## ]]")
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete", return_value=reply) as mock_completion:
+        program(input_text=input_value)
+
+    mock_completion.assert_called_once()
+    content = mock_completion.call_args.args[0].system
+
+    assert expected_input_str in content
+    assert expected_output_str in content
+
+
+def test_chat_adapter_sync_call():
+    signature = AlinGo-Prompt.make_signature("question->answer")
+    adapter = AlinGo-Prompt.ChatAdapter()
+    lm = AlinGo-Prompt.utils.DummyLM([{"answer": "Paris"}], adapter=adapter)
+    result = adapter(lm, {}, signature, [], {"question": "What is the capital of France?"})
+    assert result == [{"answer": "Paris"}]
+
+
+@pytest.mark.asyncio
+async def test_chat_adapter_async_call():
+    signature = AlinGo-Prompt.make_signature("question->answer")
+    adapter = AlinGo-Prompt.ChatAdapter()
+    lm = AlinGo-Prompt.utils.DummyLM([{"answer": "Paris"}], adapter=adapter)
+    result = await adapter.acall(lm, {}, signature, [], {"question": "What is the capital of France?"})
+    assert result == [{"answer": "Paris"}]
+
+
+def test_chat_adapter_format_exact_messages_for_simple_signature():
+    class QA(AlinGo-Prompt.Signature):
+        """Answer the question."""
+
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(), QA, [], {"question": "What is the capital of France?"})
+
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+    assert messages == [
+        {
+            "role": "system",
+            "content": """Your input fields are:
+1. `question` (str):
+Your output fields are:
+1. `answer` (str):
+All interactions will be structured in the following way, with the appropriate values filled in.
+
+[[ ## question ## ]]
+{question}
+
+[[ ## answer ## ]]
+{answer}
+
+[[ ## completed ## ]]
+In adhering to this structure, your objective is:\x20
+        Answer the question.""",
+        },
+        {
+            "role": "user",
+            "content": """[[ ## question ## ]]
+What is the capital of France?
+
+Respond with the corresponding output fields, starting with the field `[[ ## answer ## ]]`, and then ending with the marker for `[[ ## completed ## ]]`.""",
+        },
+    ]
+
+
+def test_chat_adapter_format_exact_messages_with_demo_and_typed_outputs():
+    class MultiAnswer(AlinGo-Prompt.Signature):
+        """Answer the question with multiple answers and scores"""
+
+        question: str = AlinGo-Prompt.InputField()
+        answers: list[str] = AlinGo-Prompt.OutputField()
+        scores: list[float] = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(),
+        MultiAnswer,
+        demos=[{"question": "Q1", "answers": ["A1", "A2"], "scores": [0.1, 0.9]}],
+        inputs={"question": "Q2"},
+    )
+
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+    assert messages == [
+        {
+            "role": "system",
+            "content": """Your input fields are:
+1. `question` (str):
+Your output fields are:
+1. `answers` (list[str]):\x20
+2. `scores` (list[float]):
+All interactions will be structured in the following way, with the appropriate values filled in.
+
+[[ ## question ## ]]
+{question}
+
+[[ ## answers ## ]]
+{answers}        # note: the value you produce must adhere to the JSON schema: {"type": "array", "items": {"type": "string"}}
+
+[[ ## scores ## ]]
+{scores}        # note: the value you produce must adhere to the JSON schema: {"type": "array", "items": {"type": "number"}}
+
+[[ ## completed ## ]]
+In adhering to this structure, your objective is:\x20
+        Answer the question with multiple answers and scores""",
+        },
+        {"role": "user", "content": """[[ ## question ## ]]
+Q1"""},
+        {
+            "role": "assistant",
+            "content": """[[ ## answers ## ]]
+["A1", "A2"]
+
+[[ ## scores ## ]]
+[0.1, 0.9]
+
+[[ ## completed ## ]]
+""",
+        },
+        {
+            "role": "user",
+            "content": """[[ ## question ## ]]
+Q2
+
+Respond with the corresponding output fields, starting with the field `[[ ## answers ## ]]` (must be formatted as a valid Python list[str]), then `[[ ## scores ## ]]` (must be formatted as a valid Python list[float]), and then ending with the marker for `[[ ## completed ## ]]`.""",
+        },
+    ]
+
+
+def test_chat_adapter_format_exact_messages_with_nested_pydantic_models():
+    class Address(pydantic.BaseModel):
+        city: str
+        country: str
+
+    class Person(pydantic.BaseModel):
+        name: str
+        address: Address
+        tags: list[str]
+
+    class Summary(pydantic.BaseModel):
+        headline: str
+        score: float
+
+    class PydanticSignature(AlinGo-Prompt.Signature):
+        person: Person = AlinGo-Prompt.InputField()
+        summary: Summary = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(),
+        PydanticSignature,
+        [],
+        {"person": Person(name="Ada", address=Address(city="London", country="UK"), tags=["math", "code"])},
+    )
+
+    expected_messages = [{"role": "system",
+      "content": 'Your input fields are:\n'
+                 '1. `person` (Person):\n'
+                 'Your output fields are:\n'
+                 '1. `summary` (Summary):\n'
+                 'All interactions will be structured in the following way, with the appropriate '
+                 'values filled in.\n'
+                 '\n'
+                 '[[ ## person ## ]]\n'
+                 '{person}\n'
+                 '\n'
+                 '[[ ## summary ## ]]\n'
+                 '{summary}        # note: the value you produce must adhere to the JSON schema: '
+                 '{"type": "object", "properties": {"headline": {"type": "string", "title": '
+                 '"Headline"}, "score": {"type": "number", "title": "Score"}}, "required": '
+                 '["headline", "score"], "title": "Summary"}\n'
+                 '\n'
+                 '[[ ## completed ## ]]\n'
+                 'In adhering to this structure, your objective is: \n'
+                 '        Given the fields `person`, produce the fields `summary`.'},
+     {"role": "user",
+      "content": '[[ ## person ## ]]\n'
+                 '{"name": "Ada", "address": {"city": "London", "country": "UK"}, "tags": ["math", '
+                 '"code"]}\n'
+                 '\n'
+                 'Respond with the corresponding output fields, starting with the field `[[ ## summary '
+                 '## ]]` (must be formatted as a valid Python Summary), and then ending with the '
+                 'marker for `[[ ## completed ## ]]`.'}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+def test_chat_adapter_format_exact_messages_with_incomplete_demo():
+    class IncompleteDemoSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        context: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        confidence: float = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(),
+        IncompleteDemoSignature,
+        [{"question": "Q1", "answer": "A1"}],
+        {"question": "Q2", "context": "C2"},
+    )
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `question` (str): \n"
+                 "2. `context` (str):\n"
+                 "Your output fields are:\n"
+                 "1. `answer` (str): \n"
+                 "2. `confidence` (float):\n"
+                 "All interactions will be structured in the following way, with the appropriate "
+                 "values filled in.\n"
+                 "\n"
+                 "[[ ## question ## ]]\n"
+                 "{question}\n"
+                 "\n"
+                 "[[ ## context ## ]]\n"
+                 "{context}\n"
+                 "\n"
+                 "[[ ## answer ## ]]\n"
+                 "{answer}\n"
+                 "\n"
+                 "[[ ## confidence ## ]]\n"
+                 "{confidence}        # note: the value you produce must be a single float value\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `question`, `context`, produce the fields `answer`, "
+                 "`confidence`."},
+     {"role": "user",
+      "content": "This is an example of the task, though some input or output fields are not "
+                 "supplied.\n"
+                 "\n"
+                 "[[ ## question ## ]]\n"
+                 "Q1"},
+     {"role": "assistant",
+      "content": "[[ ## answer ## ]]\n"
+                 "A1\n"
+                 "\n"
+                 "[[ ## confidence ## ]]\n"
+                 "Not supplied for this particular example.\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"},
+     {"role": "user",
+      "content": "[[ ## question ## ]]\n"
+                 "Q2\n"
+                 "\n"
+                 "[[ ## context ## ]]\n"
+                 "C2\n"
+                 "\n"
+                 "Respond with the corresponding output fields, starting with the field `[[ ## answer "
+                 "## ]]`, then `[[ ## confidence ## ]]` (must be formatted as a valid Python float), "
+                 "and then ending with the marker for `[[ ## completed ## ]]`."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+def test_chat_adapter_format_exact_messages_with_history():
+    class HistorySignature(AlinGo-Prompt.Signature):
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    history = AlinGo-Prompt.History(
+        messages=[
+            {"question": "What is 1+1?", "answer": "2"},
+            {"question": "What is 2+2?", "answer": "4"},
+        ]
+    )
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(),
+        HistorySignature,
+        [],
+        {"history": history, "question": "What is 3+3?"},
+    )
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `history` (History): \n"
+                 "2. `question` (str):\n"
+                 "Your output fields are:\n"
+                 "1. `answer` (str):\n"
+                 "All interactions will be structured in the following way, with the appropriate "
+                 "values filled in.\n"
+                 "\n"
+                 "[[ ## history ## ]]\n"
+                 "{history}\n"
+                 "\n"
+                 "[[ ## question ## ]]\n"
+                 "{question}\n"
+                 "\n"
+                 "[[ ## answer ## ]]\n"
+                 "{answer}\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `history`, `question`, produce the fields `answer`."},
+     {"role": "user", "content": "[[ ## question ## ]]\nWhat is 1+1?\n\n"
+      "Respond with the corresponding output fields, starting with the field `[[ ## answer ## ]]`, "
+      "and then ending with the marker for `[[ ## completed ## ]]`."},
+     {"role": "assistant", "content": "[[ ## answer ## ]]\n2\n\n[[ ## completed ## ]]\n"},
+     {"role": "user", "content": "[[ ## question ## ]]\nWhat is 2+2?\n\n"
+      "Respond with the corresponding output fields, starting with the field `[[ ## answer ## ]]`, "
+      "and then ending with the marker for `[[ ## completed ## ]]`."},
+     {"role": "assistant", "content": "[[ ## answer ## ]]\n4\n\n[[ ## completed ## ]]\n"},
+     {"role": "user",
+      "content": "[[ ## question ## ]]\n"
+                 "What is 3+3?\n"
+                 "\n"
+                 "Respond with the corresponding output fields, starting with the field `[[ ## answer "
+                 "## ]]`, and then ending with the marker for `[[ ## completed ## ]]`."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+def test_chat_adapter_format_exact_messages_with_list_value_for_string_input():
+    class ListAsStringSignature(AlinGo-Prompt.Signature):
+        context: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(), ListAsStringSignature, [], {"context": ["alpha", "beta"]})
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `context` (str):\n"
+                 "Your output fields are:\n"
+                 "1. `answer` (str):\n"
+                 "All interactions will be structured in the following way, with the appropriate "
+                 "values filled in.\n"
+                 "\n"
+                 "[[ ## context ## ]]\n"
+                 "{context}\n"
+                 "\n"
+                 "[[ ## answer ## ]]\n"
+                 "{answer}\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `context`, produce the fields `answer`."},
+     {"role": "user",
+      "content": "[[ ## context ## ]]\n"
+                 "[1] «alpha»\n"
+                 "[2] «beta»\n"
+                 "\n"
+                 "Respond with the corresponding output fields, starting with the field `[[ ## answer "
+                 "## ]]`, and then ending with the marker for `[[ ## completed ## ]]`."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+def test_chat_adapter_format_exact_messages_with_literal_output():
+    class LiteralSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        verdict: Literal["yes", "no"] = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(), LiteralSignature, [], {"question": "Is the sky blue?"})
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `question` (str):\n"
+                 "Your output fields are:\n"
+                 "1. `verdict` (Literal['yes', 'no']):\n"
+                 "All interactions will be structured in the following way, with the appropriate "
+                 "values filled in.\n"
+                 "\n"
+                 "[[ ## question ## ]]\n"
+                 "{question}\n"
+                 "\n"
+                 "[[ ## verdict ## ]]\n"
+                 "{verdict}        # note: the value you produce must exactly match (no extra "
+                 "characters) one of: yes; no\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `question`, produce the fields `verdict`."},
+     {"role": "user",
+      "content": "[[ ## question ## ]]\n"
+                 "Is the sky blue?\n"
+                 "\n"
+                 "Respond with the corresponding output fields, starting with the field `[[ ## verdict "
+                 "## ]]` (must be formatted as a valid Python Literal['yes', 'no']), and then ending "
+                 "with the marker for `[[ ## completed ## ]]`."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+def test_chat_adapter_format_exact_messages_with_multimodal_custom_type_inputs():
+    class CustomTypeSignature(AlinGo-Prompt.Signature):
+        image: AlinGo-Prompt.Image = AlinGo-Prompt.InputField()
+        audio: AlinGo-Prompt.Audio = AlinGo-Prompt.InputField()
+        file: AlinGo-Prompt.File = AlinGo-Prompt.InputField()
+        document: Document = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    request = format_request(AlinGo-Prompt.ChatAdapter(),
+        CustomTypeSignature,
+        [],
+        {
+            "image": AlinGo-Prompt.Image("https://example.com/cat.png"),
+            "audio": AlinGo-Prompt.Audio(data="QUJD", audio_format="wav"),
+            "file": AlinGo-Prompt.File.from_file_id("file-123", filename="notes.txt"),
+            "document": Document(data="Alpha beta", title="Doc"),
+        },
+    )
+
+    assert request.system == (
+        "Your input fields are:\n"
+        "1. `image` (Image): \n"
+        "2. `audio` (Audio): \n"
+        "3. `file` (File): \n"
+        "4. `document` (Document): \n"
+        "    Type description of Document: A document containing text content that can be "
+        "referenced and cited. Include the full text content and optionally a title for "
+        "proper referencing.\n"
+        "Your output fields are:\n"
+        "1. `answer` (str):\n"
+        "All interactions will be structured in the following way, with the appropriate "
+        "values filled in.\n"
+        "\n"
+        "[[ ## image ## ]]\n"
+        "{image}\n"
+        "\n"
+        "[[ ## audio ## ]]\n"
+        "{audio}\n"
+        "\n"
+        "[[ ## file ## ]]\n"
+        "{file}\n"
+        "\n"
+        "[[ ## document ## ]]\n"
+        "{document}\n"
+        "\n"
+        "[[ ## answer ## ]]\n"
+        "{answer}\n"
+        "\n"
+        "[[ ## completed ## ]]\n"
+        "In adhering to this structure, your objective is: \n"
+        "        Given the fields `image`, `audio`, `file`, `document`, produce the fields "
+        "`answer`."
+    )
+    assert len(request.messages) == 1
+    assert request.messages[0].role == "user"
+    assert request.messages[0].parts == (
+        TextPart("[[ ## image ## ]]\n"),
+        ImagePart(url="https://example.com/cat.png"),
+        TextPart("\n\n[[ ## audio ## ]]\n"),
+        AudioPart(data="QUJD", media_type="audio/wav"),
+        TextPart("\n\n[[ ## file ## ]]\n"),
+        DocumentPart(file_id="file-123"),
+        TextPart(
+            "\n\n[[ ## document ## ]]\n"
+            "Title: Doc\n"
+            "Alpha beta"
+            "\n"
+            "\n"
+            "Respond with the corresponding output fields, starting with the field `[[ "
+            "## answer ## ]]`, and then ending with the marker for `[[ ## completed ## "
+            "]]`."
+        ),
+    )
+    assert request.tools == ()
+
+
+def test_chat_adapter_format_exact_messages_with_history_demo_pydantic_tools_and_image():
+    def search(query: str, k: int = 3) -> str:
+        """Search for documents."""
+        return query
+
+    class Location(pydantic.BaseModel):
+        city: str
+        country: str
+
+    class Profile(pydantic.BaseModel):
+        name: str
+        location: Location
+        interests: list[str]
+
+    class AnswerCard(pydantic.BaseModel):
+        answer: str
+        sources: list[str]
+
+    class RichRenderingSignature(AlinGo-Prompt.Signature):
+        """Answer using all supplied context."""
+
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        image: AlinGo-Prompt.Image = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        profile: Profile = AlinGo-Prompt.InputField()
+        question: str = AlinGo-Prompt.InputField()
+        answer: AnswerCard = AlinGo-Prompt.OutputField()
+
+    tool = AlinGo-Prompt.Tool(search)
+    demo_profile = Profile(
+        name="Ada",
+        location=Location(city="London", country="UK"),
+        interests=["math", "machines"],
+    )
+    current_profile = Profile(
+        name="Grace",
+        location=Location(city="Arlington", country="USA"),
+        interests=["compilers", "navy"],
+    )
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "profile": demo_profile,
+                "question": "Who is Ada?",
+                "answer": AnswerCard(answer="Ada is a mathematician.", sources=["memory"]),
+            }
+        ]
+    )
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(),
+        RichRenderingSignature,
+        demos=[
+            {
+                "image": AlinGo-Prompt.Image("https://example.com/demo.png"),
+                "tools": [tool],
+                "profile": demo_profile,
+                "question": "What should we mention?",
+                "answer": AnswerCard(answer="Mention analytical engines.", sources=["demo"]),
+            }
+        ],
+        inputs={
+            "history": history,
+            "image": AlinGo-Prompt.Image("https://example.com/current.png"),
+            "tools": [tool],
+            "profile": current_profile,
+            "question": "What should the answer include?",
+        },
+    )
+
+    expected_messages = [{"role": "system",
+      "content": 'Your input fields are:\n'
+                 '1. `history` (History): \n'
+                 '2. `image` (Image): \n'
+                 '3. `tools` (list[Tool]): \n'
+                 '4. `profile` (Profile): \n'
+                 '5. `question` (str):\n'
+                 'Your output fields are:\n'
+                 '1. `answer` (AnswerCard):\n'
+                 'All interactions will be structured in the following way, with the appropriate '
+                 'values filled in.\n'
+                 '\n'
+                 '[[ ## history ## ]]\n'
+                 '{history}\n'
+                 '\n'
+                 '[[ ## image ## ]]\n'
+                 '{image}\n'
+                 '\n'
+                 '[[ ## tools ## ]]\n'
+                 '{tools}\n'
+                 '\n'
+                 '[[ ## profile ## ]]\n'
+                 '{profile}\n'
+                 '\n'
+                 '[[ ## question ## ]]\n'
+                 '{question}\n'
+                 '\n'
+                 '[[ ## answer ## ]]\n'
+                 '{answer}        # note: the value you produce must adhere to the JSON schema: '
+                 '{"type": "object", "properties": {"answer": {"type": "string", "title": "Answer"}, '
+                 '"sources": {"type": "array", "items": {"type": "string"}, "title": "Sources"}}, '
+                 '"required": ["answer", "sources"], "title": "AnswerCard"}\n'
+                 '\n'
+                 '[[ ## completed ## ]]\n'
+                 'In adhering to this structure, your objective is: \n'
+                 '        Answer using all supplied context.'},
+     {"role": "user",
+      "content": [{"type": "text",
+                   "text": "This is an example of the task, though some input or output fields are not "
+                           "supplied.\n"
+                           "\n"
+                           "[[ ## image ## ]]\n"},
+                  {"type": "image_url", "image_url": {"url": "https://example.com/demo.png"}},
+                  {"type": "text",
+                   "text": '\n'
+                           '\n'
+                           '[[ ## tools ## ]]\n'
+                           '["search, whose description is <desc>Search for documents.</desc>. It '
+                           "takes arguments {'query': {'type': 'string'}, 'k': {'type': 'integer', "
+                           '\'default\': 3}}."]\n'
+                           '\n'
+                           '[[ ## profile ## ]]\n'
+                           '{"name": "Ada", "location": {"city": "London", "country": "UK"}, '
+                           '"interests": ["math", "machines"]}\n'
+                           '\n'
+                           '[[ ## question ## ]]\n'
+                           'What should we mention?'}]},
+     {"role": "assistant",
+      "content": '[[ ## answer ## ]]\n'
+                 '{"answer": "Mention analytical engines.", "sources": ["demo"]}\n'
+                 '\n'
+                 '[[ ## completed ## ]]\n'},
+     {"role": "user",
+      "content": '[[ ## profile ## ]]\n'
+                 '{"name": "Ada", "location": {"city": "London", "country": "UK"}, "interests": '
+                 '["math", "machines"]}\n'
+                 '\n'
+                 '[[ ## question ## ]]\n'
+                 'Who is Ada?\n\n'
+                 'Respond with the corresponding output fields, starting with the field `[[ ## answer ## ]]` '
+                 '(must be formatted as a valid Python AnswerCard), and then ending with the marker '
+                 'for `[[ ## completed ## ]]`.'},
+     {"role": "assistant",
+      "content": '[[ ## answer ## ]]\n'
+                 '{"answer": "Ada is a mathematician.", "sources": ["memory"]}\n'
+                 '\n'
+                 '[[ ## completed ## ]]\n'},
+     {"role": "user",
+      "content": [{"type": "text", "text": "[[ ## image ## ]]\n"},
+                  {"type": "image_url", "image_url": {"url": "https://example.com/current.png"}},
+                  {"type": "text",
+                   "text": '\n'
+                           '\n'
+                           '[[ ## tools ## ]]\n'
+                           '["search, whose description is <desc>Search for documents.</desc>. It '
+                           "takes arguments {'query': {'type': 'string'}, 'k': {'type': 'integer', "
+                           '\'default\': 3}}."]\n'
+                           '\n'
+                           '[[ ## profile ## ]]\n'
+                           '{"name": "Grace", "location": {"city": "Arlington", "country": "USA"}, '
+                           '"interests": ["compilers", "navy"]}\n'
+                           '\n'
+                           '[[ ## question ## ]]\n'
+                           'What should the answer include?\n'
+                           '\n'
+                           'Respond with the corresponding output fields, starting with the field `[[ '
+                           '## answer ## ]]` (must be formatted as a valid Python AnswerCard), and '
+                           'then ending with the marker for `[[ ## completed ## ]]`.'}]}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+def test_chat_adapter_format_exact_messages_with_base_custom_type_input():
+    class Event(AlinGo-Prompt.Type):
+        label: str
+
+        def format(self):
+            return [TextPart(f"<event>{self.label}</event>")]
+
+        @classmethod
+        def description(cls):
+            return "An event block."
+
+    class EventSignature(AlinGo-Prompt.Signature):
+        event: Event = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(), EventSignature, [], {"event": Event(label="launch")})
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `event` (Event): \n"
+                 "    Type description of Event: An event block.\n"
+                 "Your output fields are:\n"
+                 "1. `answer` (str):\n"
+                 "All interactions will be structured in the following way, with the appropriate "
+                 "values filled in.\n"
+                 "\n"
+                 "[[ ## event ## ]]\n"
+                 "{event}\n"
+                 "\n"
+                 "[[ ## answer ## ]]\n"
+                 "{answer}\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `event`, produce the fields `answer`."},
+     {"role": "user",
+      "content": "[[ ## event ## ]]\n"
+                 "<event>launch</event>\n"
+                 "\n"
+                 "Respond with the corresponding output fields, starting with the field `[[ "
+                 "## answer ## ]]`, and then ending with the marker for `[[ ## completed ## "
+                 "]]`."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+def test_chat_adapter_format_exact_messages_with_citations_output_demo():
+    class CitationSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        citations: Citations = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(),
+        CitationSignature,
+        [
+            {
+                "question": "Q1",
+                "citations": Citations.from_dict_list(
+                    [
+                        {
+                            "cited_text": "alpha",
+                            "document_index": 0,
+                            "start_char_index": 0,
+                            "end_char_index": 5,
+                        }
+                    ]
+                ),
+            }
+        ],
+        {"question": "Q2"},
+    )
+
+    system_content = messages[0]["content"]
+    assert system_content.startswith(
+        "Your input fields are:\n"
+        "1. `question` (str):\n"
+        "Your output fields are:\n"
+        "1. `citations` (Citations): \n"
+        "    Type description of Citations: Citations with quoted text and source references. "
+        "Include the exact text being cited and information about its source.\n"
+    )
+    assert "[[ ## citations ## ]]\n{citations}        # note: the value you produce must adhere to the JSON schema: " in system_content
+    assert '"required": ["cited_text"]' in system_content
+    assert system_content.endswith(
+        "[[ ## completed ## ]]\n"
+        "In adhering to this structure, your objective is: \n"
+        "        Given the fields `question`, produce the fields `citations`."
+    )
+    assert messages[1:] == [
+     {"role": "user", "content": "[[ ## question ## ]]\nQ1"},
+     {"role": "assistant",
+      "content": '[[ ## citations ## ]]\n'
+                 '[{"type": "char_location", "cited_text": "alpha", '
+                 '"document_index": 0, "start_char_index": 0, "end_char_index": '
+                 '5}]\n'
+                 '\n'
+                 '[[ ## completed ## ]]\n'},
+     {"role": "user",
+      "content": "[[ ## question ## ]]\n"
+                 "Q2\n"
+                 "\n"
+                 "Respond with the corresponding output fields, starting with the field `[[ ## "
+                 "citations ## ]]` (must be formatted as a valid Python Citations), and then ending "
+                 "with the marker for `[[ ## completed ## ]]`."}]
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+def test_chat_adapter_keeps_citations_field_in_prompt_for_every_model():
+    """lm15 document parts carry no provider-side citation opt-in yet, so the
+    citations field is always asked for in text and parsed from the answer."""
+
+    class AnthropicLM(AlinGo-Prompt.utils.DummyLM):
+        def __init__(self):
+            super().__init__([{}])
+            self.model = "anthropic/claude-3-5-sonnet"
+
+    class CitationSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        citations: Citations = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(),
+        CitationSignature,
+        [],
+        {"question": "Q?"},
+        lm=AnthropicLM(),
+    )
+
+    assert "2. `citations` (Citations)" in messages[0]["content"]
+    assert "[[ ## citations ## ]]" in messages[0]["content"]
+    assert messages[1]["content"].endswith(
+        "starting with the field `[[ ## answer ## ]]`, then `[[ ## citations ## ]]` "
+        "(must be formatted as a valid Python Citations), and then ending with the marker for `[[ ## completed ## ]]`."
+    )
+    assert lm_kwargs == {}
+
+def test_chat_adapter_format_exact_messages_preserves_passthrough_lm_kwargs():
+    class PassthroughSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(),
+        PassthroughSignature,
+        [],
+        {"question": "Q?"},
+        lm_kwargs={"temperature": 0.7, "max_tokens": 42, "cache": False},
+    )
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `question` (str):\n"
+                 "Your output fields are:\n"
+                 "1. `answer` (str):\n"
+                 "All interactions will be structured in the following way, with the appropriate "
+                 "values filled in.\n"
+                 "\n"
+                 "[[ ## question ## ]]\n"
+                 "{question}\n"
+                 "\n"
+                 "[[ ## answer ## ]]\n"
+                 "{answer}\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `question`, produce the fields `answer`."},
+     {"role": "user",
+      "content": "[[ ## question ## ]]\n"
+                 "Q?\n"
+                 "\n"
+                 "Respond with the corresponding output fields, starting with the field `[[ ## answer "
+                 "## ]]`, and then ending with the marker for `[[ ## completed ## ]]`."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {"temperature": 0.7, "max_tokens": 42}
+    assert lm_kwargs == expected_lm_kwargs
+
+def test_chat_adapter_format_exact_messages_and_lm_kwargs_with_native_reasoning():
+    class ReasoningLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_reasoning(self):
+            return True
+
+    class NativeReasoningSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        reasoning: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(),
+        NativeReasoningSignature,
+        [],
+        {"question": "Q?"},
+        lm=ReasoningLM([{}]),
+    )
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `question` (str):\n"
+                 "Your output fields are:\n"
+                 "1. `answer` (str):\n"
+                 "All interactions will be structured in the following way, with the appropriate "
+                 "values filled in.\n"
+                 "\n"
+                 "[[ ## question ## ]]\n"
+                 "{question}\n"
+                 "\n"
+                 "[[ ## answer ## ]]\n"
+                 "{answer}\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `question`, produce the fields `reasoning`, `answer`."},
+     {"role": "user",
+      "content": "[[ ## question ## ]]\n"
+                 "Q?\n"
+                 "\n"
+                 "Respond with the corresponding output fields, starting with the field `[[ ## answer "
+                 "## ]]`, and then ending with the marker for `[[ ## completed ## ]]`."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {"reasoning_effort": "low"}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+def test_chat_adapter_native_tool_calling_still_enables_native_reasoning():
+    class NativeToolReasoningLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_function_calling(self):
+            return True
+
+        @property
+        def supports_reasoning(self):
+            return True
+
+    def search(query: str) -> str:
+        return query
+
+    class NativeToolReasoningSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        next_thought: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    _, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True),
+        NativeToolReasoningSignature,
+        [],
+        {"question": "Q?", "tools": [AlinGo-Prompt.Tool(search)]},
+        lm=NativeToolReasoningLM([{}]),
+    )
+
+    assert "tools" in lm_kwargs
+    assert lm_kwargs["reasoning_effort"] == "low"
+
+
+def test_chat_adapter_nonnative_strips_native_tool_kwargs():
+    def search(query: str) -> str:
+        return query
+
+    class NonNativeToolSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    _, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=False),
+        NonNativeToolSignature,
+        [],
+        {"question": "Q?", "tools": [AlinGo-Prompt.Tool(search)]},
+        lm_kwargs={
+            "tools": [{"type": "function", "function": {"name": "submit"}}],
+            "tool_choice": {"type": "function", "function": {"name": "submit"}},
+            "parallel_tool_calls": True,
+        },
+    )
+
+    assert "tools" not in lm_kwargs
+    assert "tool_choice" not in lm_kwargs
+    assert "parallel_tool_calls" not in lm_kwargs
+
+
+def test_chat_adapter_native_preserves_caller_tools_on_ordinary_signature():
+    """An ordinary signature (no `AlinGo-Prompt.ToolCalls` output field) never has its tool
+    wiring managed by the adapter, with or without native function calling - so a
+    caller passing native `tools`/`tool_choice` directly (outside the ToolCalls
+    mechanism, e.g. via `config=`) must keep reaching the LM untouched. Regression
+    test for a #10397 fix that briefly over-stripped this case too."""
+
+    class OrdinarySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    _, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True),
+        OrdinarySignature,
+        [],
+        {"question": "Q?"},
+        lm_kwargs={
+            "tools": [{"type": "function", "function": {"name": "search"}}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+        },
+        # Default DummyLM: supports_function_calling is False - shouldn't matter here,
+        # since this signature never opts into the ToolCalls mechanism at all.
+    )
+
+    assert lm_kwargs["tools"] == [{"type": "function", "function": {
+        "name": "search", "parameters": {"type": "object", "properties": {}},
+    }}]
+    assert lm_kwargs["tool_choice"] == "auto"
+    assert lm_kwargs["parallel_tool_calls"] is True
+
+
+def test_chat_adapter_native_strips_tool_choice_when_lm_lacks_function_calling():
+    """Regression test for #10397.
+
+    ReAct's forced-submit path always sets `tool_choice` (to force a final
+    `submit` call), regardless of whether the LM is marked as supporting
+    native function calling. When it isn't (e.g. a model missing from DSPy's
+    capability catalog), the adapter never adds `tools` - so a `tool_choice`
+    the caller already passed in must be dropped too, or OpenAI and
+    OpenAI-compatible gateways reject the request with a 400.
+    """
+
+    def search(query: str) -> str:
+        return query
+
+    class NativeToolSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    _, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True),
+        NativeToolSignature,
+        [],
+        {"question": "Q?", "tools": [AlinGo-Prompt.Tool(search)]},
+        lm_kwargs={
+            "tool_choice": {"type": "function", "function": {"name": "submit"}},
+            "parallel_tool_calls": True,
+        },
+        # Default DummyLM: supports_function_calling is False, matching a model
+        # missing from DSPy's catalog - the exact condition that triggers #10397.
+    )
+
+    assert "tools" not in lm_kwargs
+    assert "tool_choice" not in lm_kwargs
+    assert "parallel_tool_calls" not in lm_kwargs
+
+
+def test_chat_adapter_format_exact_messages_with_reasoning_and_code_outputs():
+    python_code = AlinGo-Prompt.Code["python"]
+
+    class CodeSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        reasoning: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        code: python_code = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(),
+        CodeSignature,
+        [{"question": "Q1", "reasoning": AlinGo-Prompt.Reasoning(content="Think"), "code": python_code(code="print('hi')")}],
+        {"question": "Q2"},
+    )
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `question` (str):\n"
+                 "Your output fields are:\n"
+                 "1. `reasoning` (str): \n"
+                 "2. `code` (Code_python): \n"
+                 "    Type description of Code_python: Code represented in a string, specified in the "
+                 "`code` field. If this is an output field, the code field should follow the markdown "
+                 "code block format, e.g. \n"
+                 "```python\n"
+                 "{code}\n"
+                 "```\n"
+                 "Programming language: python\n"
+                 "All interactions will be structured in the following way, with the appropriate "
+                 "values filled in.\n"
+                 "\n"
+                 "[[ ## question ## ]]\n"
+                 "{question}\n"
+                 "\n"
+                 "[[ ## reasoning ## ]]\n"
+                 "{reasoning}\n"
+                 "\n"
+                 "[[ ## code ## ]]\n"
+                 "{code}\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `question`, produce the fields `reasoning`, `code`."},
+     {"role": "user", "content": "[[ ## question ## ]]\nQ1"},
+     {"role": "assistant",
+      "content": "[[ ## reasoning ## ]]\n"
+                 "Think\n"
+                 "\n"
+                 "[[ ## code ## ]]\n"
+                 "print('hi')\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"},
+     {"role": "user",
+      "content": "[[ ## question ## ]]\n"
+                 "Q2\n"
+                 "\n"
+                 "Respond with the corresponding output fields, starting with the field `[[ ## "
+                 "reasoning ## ]]` (must be formatted as a valid Python str), then `[[ ## code ## ]]` "
+                 "(must be formatted as a valid Python Code_python), and then ending with the marker "
+                 "for `[[ ## completed ## ]]`."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+def test_chat_adapter_format_exact_messages_and_lm_kwargs_with_native_tool_calling():
+    class FunctionCallingLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_function_calling(self):
+            return True
+
+    def search(query: str, k: int = 3) -> str:
+        """Search for documents."""
+        return query
+
+    class NativeToolSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True),
+        NativeToolSignature,
+        [],
+        {"question": "Q?", "tools": [AlinGo-Prompt.Tool(search)]},
+        lm=FunctionCallingLM([{}]),
+    )
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `question` (str):\n"
+                 "Your output fields are:\n"
+                 "\n"
+                 "All interactions will be structured in the following way, with the appropriate "
+                 "values filled in.\n"
+                 "\n"
+                 "[[ ## question ## ]]\n"
+                 "{question}\n"
+                 "\n"
+                 "\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `question`, `tools`, produce the fields `tool_calls`."},
+     {"role": "user",
+      "content": "[[ ## question ## ]]\n"
+                 "Q?\n"
+                 "\n"
+                 "Respond with the corresponding output fields, starting with the field , and then "
+                 "ending with the marker for `[[ ## completed ## ]]`."}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {"tools": [{"type": "function",
+                "function": {"name": "search",
+                             "description": "Search for documents.",
+                             "parameters": {"type": "object",
+                                            "properties": {"query": {"type": "string"},
+                                                           "k": {"type": "integer", "default": 3}},
+                                            "required": ["query"]}}}]}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    [
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True, parallel_tool_calls=True),
+        AlinGo-Prompt.JSONAdapter(use_native_function_calling=True, parallel_tool_calls=True),
+        AlinGo-Prompt.XMLAdapter(use_native_function_calling=True, parallel_tool_calls=True),
+    ],
+)
+def test_adapter_native_tool_calling_can_request_parallel_tool_calls(adapter):
+    class FunctionCallingLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_function_calling(self):
+            return True
+
+    def search(query: str) -> str:
+        return query
+
+    class NativeToolSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    _messages, lm_kwargs = format_messages_and_lm_kwargs(
+        adapter,
+        NativeToolSignature,
+        [],
+        {"question": "Q?", "tools": [AlinGo-Prompt.Tool(search)]},
+        lm=FunctionCallingLM([{}]),
+    )
+
+    assert lm_kwargs["tool_choice"] == "auto"
+    assert lm_kwargs["parallel_tool_calls"] is True
+
+
+def test_adapter_native_tool_calling_respects_lm_kwargs_parallel_tool_call_override():
+    class FunctionCallingLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_function_calling(self):
+            return True
+
+    def search(query: str) -> str:
+        return query
+
+    class NativeToolSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    _messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True, parallel_tool_calls=True),
+        NativeToolSignature,
+        [],
+        {"question": "Q?", "tools": [AlinGo-Prompt.Tool(search)]},
+        lm_kwargs={"parallel_tool_calls": False},
+        lm=FunctionCallingLM([{}]),
+    )
+
+    assert lm_kwargs["tool_choice"] == "auto"
+    assert lm_kwargs["parallel_tool_calls"] is False
+
+
+def test_chat_adapter_native_tool_history_replay():
+    class FunctionCallingLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_function_calling(self):
+            return True
+
+    def search(query: str) -> str:
+        """Search for documents."""
+        return query
+
+    class NativeToolHistorySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        next_thought: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    tool_call = AlinGo-Prompt.ToolCalls.ToolCall(id="call_1", name="search", args={"query": "cats"})
+    tool_call_results = AlinGo-Prompt.ToolCallResults.from_tool_calls_and_values([tool_call], [{"items": ["cat"]}])
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "question": "Q1",
+                "next_thought": AlinGo-Prompt.Reasoning(content="I should search."),
+                "tool_calls": AlinGo-Prompt.ToolCalls(tool_calls=[tool_call], tool_call_results=tool_call_results),
+            }
+        ]
+    )
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True),
+        NativeToolHistorySignature,
+        [],
+        {"question": "Q2", "history": history, "tools": [AlinGo-Prompt.Tool(search)]},
+        lm=FunctionCallingLM([{}]),
+    )
+
+    assert messages[1]["role"] == "user"
+    assert "Q1" in messages[1]["content"]
+    assert messages[2]["role"] == "assistant"
+    assert messages[2]["content"] == "[[ ## next_thought ## ]]\nI should search.\n\n[[ ## completed ## ]]\n"
+    [call] = messages[2]["tool_calls"]
+    assert (call["id"], call["type"], call["function"]["name"]) == ("call_1", "function", "search")
+    assert json.loads(call["function"]["arguments"]) == {"query": "cats"}
+    assert messages[3]["role"] == "tool"
+    assert messages[3]["tool_call_id"] == "call_1"
+    assert messages[3]["content"] == '{"items": ["cat"]}'
+    assert messages[4]["role"] == "user"
+    assert "Q2" in messages[4]["content"]
+    assert "history" not in messages[4]["content"]
+    assert "tools" not in messages[4]["content"]
+    assert "tool_call_results" not in messages[4]["content"]
+    assert "None" not in messages[4]["content"]
+    assert "tools" in lm_kwargs
+
+
+def test_chat_adapter_native_tool_history_replays_parallel_tool_results():
+    class FunctionCallingLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_function_calling(self):
+            return True
+
+    def search(query: str) -> str:
+        return query
+
+    class NativeToolHistorySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        next_thought: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    tool_calls = AlinGo-Prompt.ToolCalls(
+        tool_calls=[
+            AlinGo-Prompt.ToolCalls.ToolCall(id="call_1", name="search", args={"query": "cats"}),
+            AlinGo-Prompt.ToolCalls.ToolCall(id="call_2", name="search", args={"query": "dogs"}),
+        ]
+    )
+    tool_call_results = AlinGo-Prompt.ToolCallResults.from_tool_calls_and_values(
+        tool_calls,
+        [{"items": ["cat"]}, {"items": ["dog"]}],
+    )
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "question": "Q1",
+                "next_thought": AlinGo-Prompt.Reasoning(content="I should search twice."),
+                "tool_calls": tool_calls.model_copy(update={"tool_call_results": tool_call_results}),
+            }
+        ]
+    )
+
+    messages, _lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True),
+        NativeToolHistorySignature,
+        [],
+        {"question": "Q2", "history": history, "tools": [AlinGo-Prompt.Tool(search)]},
+        lm=FunctionCallingLM([{}]),
+    )
+
+    assert [tool_call["id"] for tool_call in messages[2]["tool_calls"]] == ["call_1", "call_2"]
+    assert [
+        (message["role"], message["tool_call_id"], message["content"])
+        for message in messages[3:5]
+    ] == [
+        ("tool", "call_1", '{"items": ["cat"]}'),
+        ("tool", "call_2", '{"items": ["dog"]}'),
+    ]
+
+
+def _native_tool_history_request(supported_tool_result_media):
+    class FunctionCallingLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_function_calling(self):
+            return True
+
+        @property
+        def supported_tool_result_media(self):
+            return supported_tool_result_media
+
+    def screenshot() -> AlinGo-Prompt.Image:
+        return image
+
+    class NativeToolHistorySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    image = AlinGo-Prompt.Image(f"data:image/png;base64,{_PIXEL_PNG}")
+    tool_calls = AlinGo-Prompt.ToolCalls(
+        tool_calls=[
+            AlinGo-Prompt.ToolCalls.ToolCall(id="call_1", name="screenshot", args={}),
+            AlinGo-Prompt.ToolCalls.ToolCall(id="call_2", name="screenshot", args={}),
+            AlinGo-Prompt.ToolCalls.ToolCall(id="call_3", name="screenshot", args={}),
+        ]
+    )
+    tool_call_results = AlinGo-Prompt.ToolCallResults.from_tool_calls_and_values(
+        tool_calls, [image, {"page": "home", "screenshot": image}, Score(value=0.5, confidence=0.9)]
+    )
+    history = AlinGo-Prompt.History(
+        messages=[
+            {"question": "Q1", "tool_calls": tool_calls.model_copy(update={"tool_call_results": tool_call_results})}
+        ]
+    )
+    return format_request(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True),
+        NativeToolHistorySignature,
+        [],
+        {"question": "Q2", "history": history, "tools": [AlinGo-Prompt.Tool(screenshot)]},
+        lm=FunctionCallingLM([{}]),
+    )
+
+
+_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+
+
+def test_chat_adapter_native_tool_history_sends_tool_result_images_as_image_parts():
+    request = _native_tool_history_request({"image", "document"})
+
+    results = [part for message in request.messages if message.role == "tool" for part in message.parts]
+    bare, nested, structured = (result.content for result in results)
+    assert [(part.type, part.media_type, part.data) for part in bare] == [("image", "image/png", _PIXEL_PNG)]
+    assert [part.type for part in nested] == ["text", "image", "text"]
+    nested_text = "".join(part.text for part in nested if part.type == "text")
+    assert '"page": "home"' in nested_text
+    assert [json.loads(part.text) for part in structured] == [{"value": 0.5, "confidence": 0.9}]
+    assert [message.role for message in request.messages][-2:] == ["tool", "user"]  # no attachments message
+
+
+def test_chat_adapter_moves_tool_result_images_to_a_user_message_when_tool_results_take_text_only():
+    request = _native_tool_history_request(set())
+
+    roles = [message.role for message in request.messages]
+    assert roles[-3:] == ["tool", "user", "user"]
+    tool_message, attachments = request.messages[-3], request.messages[-2]
+    bare, nested, structured = (result.content for result in tool_message.parts)
+    assert [part.type for part in (*bare, *nested, *structured)] == ["text"] * 5
+    assert bare[0].text == "[image attached in the next message]"
+    assert [(part.type, getattr(part, "text", None)) for part in attachments.parts] == [
+        ("text", "Attachments from tool call call_1 (screenshot):"),
+        ("image", None),
+        ("text", "Attachments from tool call call_2 (screenshot):"),
+        ("image", None),
+    ]
+    # The Chat Completions writer, whose tool rows take text only, now accepts the request.
+    messages, _ = openai_view(request)
+    assert [message["role"] for message in messages][-5:] == ["tool", "tool", "tool", "user", "user"]
+    assert messages[-2]["content"][1]["type"] == "image_url"
+
+
+def test_chat_adapter_native_tool_history_skips_empty_user_message():
+    class FunctionCallingLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_function_calling(self):
+            return True
+
+    def search(query: str) -> str:
+        return query
+
+    class NativeToolHistorySignature(AlinGo-Prompt.Signature):
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        next_thought: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    tool_call = AlinGo-Prompt.ToolCalls.ToolCall(id="call_1", name="search", args={"query": "cats"})
+    tool_call_results = AlinGo-Prompt.ToolCallResults.from_tool_calls_and_values([tool_call], ["cat result"])
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "tool_calls": AlinGo-Prompt.ToolCalls(tool_calls=[tool_call], tool_call_results=tool_call_results),
+            }
+        ]
+    )
+
+    messages, _ = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True),
+        NativeToolHistorySignature,
+        [],
+        {"history": history, "tools": [AlinGo-Prompt.Tool(search)]},
+        lm=FunctionCallingLM([{}]),
+    )
+
+    assert messages[1]["role"] == "assistant"
+    assert messages[1]["content"] is None
+    assert messages[2]["role"] == "tool"
+
+
+@pytest.mark.parametrize(
+    "tool_call_id, tool_call_results",
+    [
+        ("call_1", None),
+        (
+            "call_1",
+            AlinGo-Prompt.ToolCallResults(
+                tool_call_results=[
+                    AlinGo-Prompt.ToolCallResults.ToolCallResult(call_id="other_call", name="search", value="cat result")
+                ]
+            ),
+        ),
+        (
+            None,
+            AlinGo-Prompt.ToolCallResults(
+                tool_call_results=[
+                    AlinGo-Prompt.ToolCallResults.ToolCallResult(call_id=None, name="search", value="cat result")
+                ]
+            ),
+        ),
+    ],
+)
+def test_chat_adapter_native_tool_history_skips_unmatched_tool_calls(tool_call_id, tool_call_results):
+    class FunctionCallingLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_function_calling(self):
+            return True
+
+    def search(query: str) -> str:
+        return query
+
+    class NativeToolHistorySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        next_thought: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    tool_call = AlinGo-Prompt.ToolCalls.ToolCall(id=tool_call_id, name="search", args={"query": "cats"})
+    tool_calls = AlinGo-Prompt.ToolCalls(tool_calls=[tool_call], tool_call_results=tool_call_results)
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "question": "Q1",
+                "next_thought": AlinGo-Prompt.Reasoning(content="I should search."),
+                "tool_calls": tool_calls,
+            }
+        ]
+    )
+
+    messages, _ = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=True),
+        NativeToolHistorySignature,
+        [],
+        {"question": "Q2", "history": history, "tools": [AlinGo-Prompt.Tool(search)]},
+        lm=FunctionCallingLM([{}]),
+    )
+
+    assert all("tool_calls" not in message for message in messages)
+    assert all(message["role"] != "tool" for message in messages)
+    assert messages[2]["role"] == "assistant"
+    assert "I should search." in messages[2]["content"]
+
+
+def test_chat_adapter_format_exact_messages_with_non_native_tool_history():
+    def search(query: str) -> str:
+        return query
+
+    class ToolHistorySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        next_thought: str = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    tool_call = AlinGo-Prompt.ToolCalls.ToolCall(id="call_1", name="search", args={"query": "cats"})
+    tool_call_results = AlinGo-Prompt.ToolCallResults.from_tool_calls_and_values([tool_call], ["cat"])
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "question": "Q1",
+                "next_thought": "I should search.",
+                "tool_calls": AlinGo-Prompt.ToolCalls(tool_calls=[tool_call], tool_call_results=tool_call_results),
+            }
+        ]
+    )
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(use_native_function_calling=False),
+        ToolHistorySignature,
+        [],
+        {"question": "Q2", "history": history, "tools": [AlinGo-Prompt.Tool(search)]},
+    )
+
+    expected_messages = [
+        {
+            "role": "system",
+            "content": "Your input fields are:\n"
+            "1. `question` (str): \n"
+            "2. `history` (History): \n"
+            "3. `tools` (list[Tool]):\n"
+            "Your output fields are:\n"
+            "1. `next_thought` (str): \n"
+            "2. `tool_calls` (ToolCalls): \n"
+            "    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of "
+            'calls. Each call must include `name` and `args`. Example: {"tool_calls": [{"name": "search", '
+            '"args": {"query": "cats"}}]}\n'
+            "All interactions will be structured in the following way, with the appropriate values filled in.\n"
+            "\n"
+            "[[ ## question ## ]]\n"
+            "{question}\n"
+            "\n"
+            "[[ ## history ## ]]\n"
+            "{history}\n"
+            "\n"
+            "[[ ## tools ## ]]\n"
+            "{tools}\n"
+            "\n"
+            "[[ ## next_thought ## ]]\n"
+            "{next_thought}\n"
+            "\n"
+            "[[ ## tool_calls ## ]]\n"
+            '{tool_calls}        # note: the value you produce must adhere to the JSON schema: {"type": "object", '
+            '"$defs": {"ToolCall": {"type": "object", "properties": {"args": {"type": "object", '
+            '"additionalProperties": true, "title": "Args"}, "name": {"type": "string", "title": "Name"}}, '
+            '"required": ["name", "args"], "title": "ToolCall"}}, "properties": {"tool_calls": {"type": "array", '
+            '"items": {"$ref": "#/$defs/ToolCall"}, "title": "Tool Calls"}}, "required": ["tool_calls"], "title": '
+            '"ToolCalls"}\n'
+            "\n"
+            "[[ ## completed ## ]]\n"
+            "In adhering to this structure, your objective is: \n"
+            "        Given the fields `question`, `history`, `tools`, produce the fields `next_thought`, "
+            "`tool_calls`.",
+        },
+        {"role": "user", "content": "[[ ## question ## ]]\nQ1\n\n"
+         "Respond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then "
+         '`[[ ## tool_calls ## ]]` (must be a JSON object like {"tool_calls": [{"name": "...", "args": {...}}]}), '
+         "and then ending with the marker for `[[ ## completed ## ]]`."},
+        {
+            "role": "assistant",
+            "content": "[[ ## next_thought ## ]]\n"
+            "I should search.\n"
+            "\n"
+            "[[ ## tool_calls ## ]]\n"
+            '{"tool_calls": [{"name": "search", "args": {"query": "cats"}}]}\n'
+            "\n"
+            "[[ ## completed ## ]]\n",
+        },
+        {
+            "role": "user",
+            "content": "[[ ## tool_call_results ## ]]\n"
+            '{"tool_call_results": [{"call_id": "call_1", "name": "search", "value": "cat", "is_error": false}]}',
+        },
+        {
+            "role": "user",
+            "content": "[[ ## question ## ]]\n"
+            "Q2\n"
+            "\n"
+            "[[ ## tools ## ]]\n"
+            '["search. It takes arguments {\'query\': {\'type\': \'string\'}}."]\n'
+            "\n"
+            "Respond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then "
+            '`[[ ## tool_calls ## ]]` (must be a JSON object like {"tool_calls": [{"name": "...", "args": {...}}]}), and then ending with the '
+            "marker for `[[ ## completed ## ]]`.",
+        },
+    ]
+    assert messages == expected_messages
+    assert lm_kwargs == {}
+
+
+@pytest.mark.parametrize(
+    "adapter",
+    [AlinGo-Prompt.ChatAdapter(use_native_function_calling=False), AlinGo-Prompt.JSONAdapter(use_native_function_calling=False)],
+)
+def test_non_native_tool_history_remains_text_based(adapter):
+    def search(query: str) -> str:
+        return query
+
+    class ToolHistorySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        next_thought: str = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    tool_call = AlinGo-Prompt.ToolCalls.ToolCall(id="call_1", name="search", args={"query": "cats"})
+    tool_call_results = AlinGo-Prompt.ToolCallResults.from_tool_calls_and_values([tool_call], ["cat"])
+    prompt = adapter.format(
+        ToolHistorySignature,
+        [],
+        {
+            "question": "Q2",
+            "history": AlinGo-Prompt.History(
+                messages=[
+                    {
+                        "question": "Q1",
+                        "next_thought": "I should search.",
+                        "tool_calls": AlinGo-Prompt.ToolCalls(tool_calls=[tool_call], tool_call_results=tool_call_results),
+                    }
+                ]
+            ),
+            "tools": [AlinGo-Prompt.Tool(search)],
+        },
+    )
+
+    messages = prompt.messages
+    assert all(message.role != "tool" for message in messages)
+    assert [message.role for message in messages] == ["user", "assistant", "user", "user"]
+    assert "Q1" in messages[0].text
+    assert "tool_call_results" not in messages[0].text
+    assert "tool_calls" in messages[1].text
+    assert "[[ ## tool_call_results ## ]]" in messages[2].text
+    assert "cat" in messages[2].text
+    assert "Q2" not in messages[2].text
+    assert "Q2" in messages[3].text
+    assert "None" not in messages[2].text
+
+
+def test_chat_adapter_format_accepts_custom_history_formatter_returning_messages_only():
+    class CustomHistoryAdapter(AlinGo-Prompt.ChatAdapter):
+        def format_conversation_history(self, signature, history_field_name, inputs):
+            del inputs[history_field_name]
+            return [LMMessage.user("custom history")]
+
+    class HistorySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    prompt = CustomHistoryAdapter().format(
+        HistorySignature,
+        [],
+        {
+            "question": "Q2",
+            "history": AlinGo-Prompt.History(messages=[{"question": "Q1"}]),
+        },
+    )
+
+    assert prompt.messages[0] == LMMessage.user("custom history")
+    assert prompt.messages[1].role == "user"
+    assert "Q2" in prompt.messages[1].text
+
+
+def test_chat_adapter_format_exact_messages_with_tool_input():
+    def search(query: str, k: int = 3) -> str:
+        """Search for documents."""
+        return query
+
+    class ToolSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(AlinGo-Prompt.ChatAdapter(),
+        ToolSignature,
+        [],
+        {"question": "Q?", "tools": [AlinGo-Prompt.Tool(search)]},
+    )
+
+    expected_messages = [{"role": "system",
+      "content": "Your input fields are:\n"
+                 "1. `question` (str): \n"
+                 "2. `tools` (list[Tool]):\n"
+                 "Your output fields are:\n"
+                 "1. `answer` (str):\n"
+                 "All interactions will be structured in the following way, with the appropriate "
+                 "values filled in.\n"
+                 "\n"
+                 "[[ ## question ## ]]\n"
+                 "{question}\n"
+                 "\n"
+                 "[[ ## tools ## ]]\n"
+                 "{tools}\n"
+                 "\n"
+                 "[[ ## answer ## ]]\n"
+                 "{answer}\n"
+                 "\n"
+                 "[[ ## completed ## ]]\n"
+                 "In adhering to this structure, your objective is: \n"
+                 "        Given the fields `question`, `tools`, produce the fields `answer`."},
+     {"role": "user",
+      "content": '[[ ## question ## ]]\n'
+                 'Q?\n'
+                 '\n'
+                 '[[ ## tools ## ]]\n'
+                 '["search, whose description is <desc>Search for documents.</desc>. It takes '
+                 "arguments {'query': {'type': 'string'}, 'k': {'type': 'integer', 'default': "
+                 '3}}."]\n'
+                 '\n'
+                 'Respond with the corresponding output fields, starting with the field `[[ ## answer '
+                 '## ]]`, and then ending with the marker for `[[ ## completed ## ]]`.'}]
+    assert messages == expected_messages
+    expected_lm_kwargs = {}
+    assert lm_kwargs == expected_lm_kwargs
+
+
+def test_chat_adapter_repl_history_replay_non_reasoning_lm():
+    class NonReasoningLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_reasoning(self):
+            return False
+
+    class REPLHistorySignature(AlinGo-Prompt.Signature):
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        variables_info: str = AlinGo-Prompt.InputField()
+        reasoning: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        code: str = AlinGo-Prompt.OutputField()
+
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "variables_info": "INFO_1",
+                "repl_entry": REPLEntry(
+                    reasoning="First explore the data",
+                    code="x = 10\nprint(f'x = {x}')",
+                    output="x = 10",
+                    max_output_chars=100,
+                ),
+            }
+        ]
+    )
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(),
+        REPLHistorySignature,
+        [],
+        {"variables_info": "INFO_2", "history": history},
+        lm=NonReasoningLM([{}]),
+    )
+
+    assert messages[1]["role"] == "user"
+    assert "INFO_1" in messages[1]["content"]
+    assert messages[2] == {
+        "role": "assistant",
+        "content": "[[ ## reasoning ## ]]\nFirst explore the data\n\n[[ ## code ## ]]\nx = 10\nprint(f'x = {x}')\n\n[[ ## completed ## ]]\n",
+    }
+    assert messages[3] == {
+        "role": "user",
+        "content": "[[ ## repl_output ## ]]\nx = 10",
+    }
+    assert messages[4]["role"] == "user"
+    assert "INFO_2" in messages[4]["content"]
+    assert "history" not in messages[4]["content"]
+    assert "reasoning_effort" not in lm_kwargs
+
+
+def test_chat_adapter_repl_history_replay_reasoning_lm():
+    class ReasoningLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_reasoning(self):
+            return True
+
+    class REPLHistorySignature(AlinGo-Prompt.Signature):
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        variables_info: str = AlinGo-Prompt.InputField()
+        reasoning: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        code: str = AlinGo-Prompt.OutputField()
+
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "variables_info": "INFO_1",
+                "repl_entry": REPLEntry(
+                    reasoning="First explore the data",
+                    code="x = 10\nprint(f'x = {x}')",
+                    output="x = 10\n",
+                    max_output_chars=100,
+                ),
+            }
+        ]
+    )
+
+    messages, lm_kwargs = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(),
+        REPLHistorySignature,
+        [],
+        {"variables_info": "INFO_2", "history": history},
+        lm=ReasoningLM([{}]),
+    )
+
+    assert messages[1]["role"] == "user"
+    assert "INFO_1" in messages[1]["content"]
+    assert messages[2] == {
+        "role": "assistant",
+        "content": "[[ ## code ## ]]\nx = 10\nprint(f'x = {x}')\n\n[[ ## completed ## ]]\n",
+    }
+    assert messages[3] == {
+        "role": "user",
+        "content": "[[ ## repl_output ## ]]\nx = 10",
+    }
+    assert messages[4]["role"] == "user"
+    assert "INFO_2" in messages[4]["content"]
+    assert "history" not in messages[4]["content"]
+    assert "reasoning_effort" in lm_kwargs
+
+
+def test_chat_adapter_repl_history_replay_with_output_truncation():
+    class ReasoningLM(AlinGo-Prompt.utils.DummyLM):
+        @property
+        def supports_reasoning(self):
+            return True
+
+    class REPLHistorySignature(AlinGo-Prompt.Signature):
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        variables_info: str = AlinGo-Prompt.InputField()
+        reasoning: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        code: str = AlinGo-Prompt.OutputField()
+
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "variables_info": "INFO_1",
+                "repl_entry": REPLEntry(
+                    reasoning="First explore the data",
+                    code="x = 10\nprint(f'x = {x}')",
+                    output="x = 10\n",
+                    max_output_chars=4,
+                ),
+            }
+        ]
+    )
+
+    messages, _ = format_messages_and_lm_kwargs(
+        AlinGo-Prompt.ChatAdapter(),
+        REPLHistorySignature,
+        [],
+        {"variables_info": "INFO_2", "history": history},
+        lm=ReasoningLM([{}]),
+    )
+
+    assert messages[1]["role"] == "user"
+    assert "INFO_1" in messages[1]["content"]
+    assert messages[2] == {
+        "role": "assistant",
+        "content": "[[ ## code ## ]]\nx = 10\nprint(f'x = {x}')\n\n[[ ## completed ## ]]\n",
+    }
+    assert messages[3] == {
+        "role": "user",
+        "content": "[[ ## repl_output ## ]]\nx \n\n... (3 characters omitted) ...\n\n0",
+    }
+
+
+def test_chat_adapter_format_exact_messages_kitchen_sink():
+    def search(query: str, k: int = 3) -> str:
+        """Search for documents."""
+        return query
+
+    class Event(AlinGo-Prompt.Type):
+        label: str
+
+        def format(self):
+            return [TextPart(f"<event>{self.label}</event>")]
+
+        @classmethod
+        def description(cls):
+            return "An event block."
+
+    class Location(pydantic.BaseModel):
+        city: str
+        country: str
+
+    class Profile(pydantic.BaseModel):
+        name: str
+        location: Location
+        interests: list[str]
+
+    class AnswerCard(pydantic.BaseModel):
+        answer: str
+        sources: list[str]
+
+    class KitchenSinkSignature(AlinGo-Prompt.Signature):
+        """Answer carefully using every available signal."""
+
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        image: AlinGo-Prompt.Image = AlinGo-Prompt.InputField()
+        audio: AlinGo-Prompt.Audio = AlinGo-Prompt.InputField()
+        file: AlinGo-Prompt.File = AlinGo-Prompt.InputField()
+        document: Document = AlinGo-Prompt.InputField()
+        event: Event = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        profile: Profile = AlinGo-Prompt.InputField()
+        context: str = AlinGo-Prompt.InputField()
+        question: str = AlinGo-Prompt.InputField()
+        answer: AnswerCard = AlinGo-Prompt.OutputField()
+        verdict: Literal["yes", "no"] = AlinGo-Prompt.OutputField()
+        confidence: float = AlinGo-Prompt.OutputField()
+
+    tool = AlinGo-Prompt.Tool(search)
+    demo_profile = Profile(
+        name="Ada",
+        location=Location(city="London", country="UK"),
+        interests=["math", "machines"],
+    )
+    current_profile = Profile(
+        name="Grace",
+        location=Location(city="Arlington", country="USA"),
+        interests=["compilers", "navy"],
+    )
+    history = AlinGo-Prompt.History(
+        messages=[
+            {
+                "profile": demo_profile,
+                "context": ["old note", "older note"],
+                "question": "Who is Ada?",
+                "answer": AnswerCard(answer="Ada is a mathematician.", sources=["memory"]),
+                "verdict": "yes",
+                "confidence": 0.8,
+            }
+        ]
+    )
+    request = format_request(AlinGo-Prompt.ChatAdapter(),
+        KitchenSinkSignature,
+        demos=[
+            {
+                "image": AlinGo-Prompt.Image("https://example.com/demo.png"),
+                "audio": AlinGo-Prompt.Audio(data="REVNTw==", audio_format="wav"),
+                "file": AlinGo-Prompt.File.from_file_id("file-demo", filename="demo.txt"),
+                "document": Document(data="Demo document", title="Demo Doc"),
+                "event": Event(label="demo-event"),
+                "tools": [tool],
+                "profile": demo_profile,
+                "context": ["demo context one", "demo context two"],
+                "question": "What should we mention?",
+                "answer": AnswerCard(answer="Mention analytical engines.", sources=["demo"]),
+                "verdict": "yes",
+                "confidence": 0.9,
+            },
+            {
+                "question": "Incomplete example question",
+                "answer": AnswerCard(answer="Partial answer.", sources=["partial"]),
+            },
+        ],
+        inputs={
+            "history": history,
+            "image": AlinGo-Prompt.Image("https://example.com/current.png"),
+            "audio": AlinGo-Prompt.Audio(data="Q1VSUkVOVA==", audio_format="wav"),
+            "file": AlinGo-Prompt.File.from_file_id("file-current", filename="current.txt"),
+            "document": Document(data="Current document", title="Current Doc"),
+            "event": Event(label="current-event"),
+            "tools": [tool],
+            "profile": current_profile,
+            "context": ["current context one", "current context two"],
+            "question": "What should the answer include?",
+        },
+    )
+
+    expected_messages = [{"role": "system",
+      "content": 'Your input fields are:\n'
+                 '1. `history` (History): \n'
+                 '2. `image` (Image): \n'
+                 '3. `audio` (Audio): \n'
+                 '4. `file` (File): \n'
+                 '5. `document` (Document): \n'
+                 '    Type description of Document: A document containing text content that can be '
+                 'referenced and cited. Include the full text content and optionally a title for '
+                 'proper referencing.\n'
+                 '6. `event` (Event): \n'
+                 '    Type description of Event: An event block.\n'
+                 '7. `tools` (list[Tool]): \n'
+                 '8. `profile` (Profile): \n'
+                 '9. `context` (str): \n'
+                 '10. `question` (str):\n'
+                 'Your output fields are:\n'
+                 '1. `answer` (AnswerCard): \n'
+                 "2. `verdict` (Literal['yes', 'no']): \n"
+                 '3. `confidence` (float):\n'
+                 'All interactions will be structured in the following way, with the appropriate '
+                 'values filled in.\n'
+                 '\n'
+                 '[[ ## history ## ]]\n'
+                 '{history}\n'
+                 '\n'
+                 '[[ ## image ## ]]\n'
+                 '{image}\n'
+                 '\n'
+                 '[[ ## audio ## ]]\n'
+                 '{audio}\n'
+                 '\n'
+                 '[[ ## file ## ]]\n'
+                 '{file}\n'
+                 '\n'
+                 '[[ ## document ## ]]\n'
+                 '{document}\n'
+                 '\n'
+                 '[[ ## event ## ]]\n'
+                 '{event}\n'
+                 '\n'
+                 '[[ ## tools ## ]]\n'
+                 '{tools}\n'
+                 '\n'
+                 '[[ ## profile ## ]]\n'
+                 '{profile}\n'
+                 '\n'
+                 '[[ ## context ## ]]\n'
+                 '{context}\n'
+                 '\n'
+                 '[[ ## question ## ]]\n'
+                 '{question}\n'
+                 '\n'
+                 '[[ ## answer ## ]]\n'
+                 '{answer}        # note: the value you produce must adhere to the JSON schema: '
+                 '{"type": "object", "properties": {"answer": {"type": "string", "title": "Answer"}, '
+                 '"sources": {"type": "array", "items": {"type": "string"}, "title": "Sources"}}, '
+                 '"required": ["answer", "sources"], "title": "AnswerCard"}\n'
+                 '\n'
+                 '[[ ## verdict ## ]]\n'
+                 '{verdict}        # note: the value you produce must exactly match (no extra '
+                 'characters) one of: yes; no\n'
+                 '\n'
+                 '[[ ## confidence ## ]]\n'
+                 '{confidence}        # note: the value you produce must be a single float value\n'
+                 '\n'
+                 '[[ ## completed ## ]]\n'
+                 'In adhering to this structure, your objective is: \n'
+                 '        Answer carefully using every available signal.'},
+     {"role": "user",
+      "content": [{"type": "text",
+                   "text": "This is an example of the task, though some input or output fields are not "
+                           "supplied.\n"
+                           "\n"
+                           "[[ ## image ## ]]\n"},
+                  {"type": "image_url", "image_url": {"url": "https://example.com/demo.png"}},
+                  {"type": "text", "text": "\n\n[[ ## audio ## ]]\n"},
+                  {"type": "input_audio", "input_audio": {"data": "REVNTw==", "format": "wav"}},
+                  {"type": "text", "text": "\n\n[[ ## file ## ]]\n"},
+                  {"type": "file", "file": {"file_id": "file-demo"}},
+                  {"type": "text",
+                   "text": '\n\n[[ ## document ## ]]\n'
+                           'Title: Demo Doc\n'
+                           'Demo document'
+                           '\n\n[[ ## event ## ]]\n'
+                           '<event>demo-event</event>'
+                           '\n'
+                           '\n'
+                           '[[ ## tools ## ]]\n'
+                           '["search, whose description is <desc>Search for documents.</desc>. It '
+                           "takes arguments {'query': {'type': 'string'}, 'k': {'type': 'integer', "
+                           '\'default\': 3}}."]\n'
+                           '\n'
+                           '[[ ## profile ## ]]\n'
+                           '{"name": "Ada", "location": {"city": "London", "country": "UK"}, '
+                           '"interests": ["math", "machines"]}\n'
+                           '\n'
+                           '[[ ## context ## ]]\n'
+                           '[1] «demo context one»\n'
+                           '[2] «demo context two»\n'
+                           '\n'
+                           '[[ ## question ## ]]\n'
+                           'What should we mention?'}]},
+     {"role": "assistant",
+      "content": '[[ ## answer ## ]]\n'
+                 '{"answer": "Mention analytical engines.", "sources": ["demo"]}\n'
+                 '\n'
+                 '[[ ## verdict ## ]]\n'
+                 'yes\n'
+                 '\n'
+                 '[[ ## confidence ## ]]\n'
+                 '0.9\n'
+                 '\n'
+                 '[[ ## completed ## ]]\n'},
+     {"role": "user",
+      "content": "This is an example of the task, though some input or output fields are not "
+                 "supplied.\n"
+                 "\n"
+                 "[[ ## question ## ]]\n"
+                 "Incomplete example question"},
+     {"role": "assistant",
+      "content": '[[ ## answer ## ]]\n'
+                 '{"answer": "Partial answer.", "sources": ["partial"]}\n'
+                 '\n'
+                 '[[ ## verdict ## ]]\n'
+                 'Not supplied for this particular example. \n'
+                 '\n'
+                 '[[ ## confidence ## ]]\n'
+                 'Not supplied for this particular example.\n'
+                 '\n'
+                 '[[ ## completed ## ]]\n'},
+     {"role": "user",
+      "content": '[[ ## profile ## ]]\n'
+                 '{"name": "Ada", "location": {"city": "London", "country": "UK"}, "interests": '
+                 '["math", "machines"]}\n'
+                 '\n'
+                 '[[ ## context ## ]]\n'
+                 '[1] «old note»\n'
+                 '[2] «older note»\n'
+                 '\n'
+                 '[[ ## question ## ]]\n'
+                 'Who is Ada?\n\n'
+                 'Respond with the corresponding output fields, starting with the field `[[ ## answer ## ]]` '
+                 '(must be formatted as a valid Python AnswerCard), then `[[ ## verdict ## ]]` '
+                 "(must be formatted as a valid Python Literal['yes', 'no']), then `[[ ## confidence ## ]]` "
+                 '(must be formatted as a valid Python float), and then ending with the marker '
+                 'for `[[ ## completed ## ]]`.'},
+     {"role": "assistant",
+      "content": '[[ ## answer ## ]]\n'
+                 '{"answer": "Ada is a mathematician.", "sources": ["memory"]}\n'
+                 '\n'
+                 '[[ ## verdict ## ]]\n'
+                 'yes\n'
+                 '\n'
+                 '[[ ## confidence ## ]]\n'
+                 '0.8\n'
+                 '\n'
+                 '[[ ## completed ## ]]\n'},
+     {"role": "user",
+      "content": [{"type": "text", "text": "[[ ## image ## ]]\n"},
+                  {"type": "image_url", "image_url": {"url": "https://example.com/current.png"}},
+                  {"type": "text", "text": "\n\n[[ ## audio ## ]]\n"},
+                  {"type": "input_audio", "input_audio": {"data": "Q1VSUkVOVA==", "format": "wav"}},
+                  {"type": "text", "text": "\n\n[[ ## file ## ]]\n"},
+                  {"type": "file", "file": {"file_id": "file-current"}},
+                  {"type": "text",
+                   "text": '\n\n[[ ## document ## ]]\n'
+                           'Title: Current Doc\n'
+                           'Current document'
+                           '\n\n[[ ## event ## ]]\n'
+                           '<event>current-event</event>'
+                           '\n'
+                           '\n'
+                           '[[ ## tools ## ]]\n'
+                           '["search, whose description is <desc>Search for documents.</desc>. It '
+                           "takes arguments {'query': {'type': 'string'}, 'k': {'type': 'integer', "
+                           '\'default\': 3}}."]\n'
+                           '\n'
+                           '[[ ## profile ## ]]\n'
+                           '{"name": "Grace", "location": {"city": "Arlington", "country": "USA"}, '
+                           '"interests": ["compilers", "navy"]}\n'
+                           '\n'
+                           '[[ ## context ## ]]\n'
+                           '[1] «current context one»\n'
+                           '[2] «current context two»\n'
+                           '\n'
+                           '[[ ## question ## ]]\n'
+                           'What should the answer include?\n'
+                           '\n'
+                           'Respond with the corresponding output fields, starting with the field `[[ '
+                           '## answer ## ]]` (must be formatted as a valid Python AnswerCard), then '
+                           "`[[ ## verdict ## ]]` (must be formatted as a valid Python Literal['yes', "
+                           "'no']), then `[[ ## confidence ## ]]` (must be formatted as a valid Python "
+                           'float), and then ending with the marker for `[[ ## completed ## ]]`.'}]}]
+    # The expected prompt is spelled in OpenAI-style blocks for readability;
+    # the adapter itself produced lm15 parts, compared here part by part.
+    def as_parts(content):
+        if isinstance(content, str):
+            return (TextPart(content),)
+        parts = []
+        for block in content:
+            if block["type"] == "text":
+                part = TextPart(block["text"])
+            elif block["type"] == "image_url":
+                part = ImagePart(url=block["image_url"]["url"])
+            elif block["type"] == "input_audio":
+                part = AudioPart(data=block["input_audio"]["data"], media_type="audio/wav")
+            else:
+                part = DocumentPart(file_id=block["file"]["file_id"])
+            if parts and isinstance(part, TextPart) and isinstance(parts[-1], TextPart):
+                parts[-1] = TextPart(parts[-1].text + part.text)
+            else:
+                parts.append(part)
+        return tuple(parts)
+
+    assert request.system == expected_messages[0]["content"]
+    assert [(m.role, m.parts) for m in request.messages] == [
+        (m["role"], as_parts(m["content"])) for m in expected_messages[1:]
+    ]
+    assert request.tools == ()
+
+def test_chat_adapter_with_pydantic_models():
+    """
+    This test verifies that ChatAdapter can handle different input and output field types, both basic and nested.
+    """
+
+    class DogClass(pydantic.BaseModel):
+        dog_breeds: list[str] = pydantic.Field(description="List of the breeds of dogs")
+        num_dogs: int = pydantic.Field(description="Number of dogs the owner has", ge=0, le=10)
+
+    class PetOwner(pydantic.BaseModel):
+        name: str = pydantic.Field(description="Name of the owner")
+        num_pets: int = pydantic.Field(description="Amount of pets the owner has", ge=0, le=100)
+        dogs: DogClass = pydantic.Field(description="Nested Pydantic class with dog specific information ")
+
+    class Answer(pydantic.BaseModel):
+        result: str
+        analysis: str
+
+    class TestSignature(AlinGo-Prompt.Signature):
+        owner: PetOwner = AlinGo-Prompt.InputField()
+        question: str = AlinGo-Prompt.InputField()
+        output: Answer = AlinGo-Prompt.OutputField()
+
+    AlinGo-Prompt.configure(lm=AlinGo-Prompt.LM(model="openai/gpt-4o"), adapter=AlinGo-Prompt.ChatAdapter())
+    program = AlinGo-Prompt.Predict(TestSignature)
+
+    reply = make_response('[[ ## output ## ]]\n{"result": "3", "analysis": "5 pets, 2 dogs"}\n\n[[ ## completed ## ]]')
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete", return_value=reply) as mock_completion:
+        program(
+            owner=PetOwner(name="John", num_pets=5, dogs=DogClass(dog_breeds=["labrador", "chihuahua"], num_dogs=2)),
+            question="How many non-dog pets does John have?",
+        )
+
+    mock_completion.assert_called_once()
+    request = mock_completion.call_args.args[0]
+
+    system_content = request.system
+    user_content = request.messages[0].text
+    assert "1. `owner` (PetOwner)" in system_content
+    assert "2. `question` (str)" in system_content
+    assert "1. `output` (Answer)" in system_content
+
+    assert "name" in user_content
+    assert "num_pets" in user_content
+    assert "dogs" in user_content
+    assert "dog_breeds" in user_content
+    assert "num_dogs" in user_content
+    assert "How many non-dog pets does John have?" in user_content
+
+
+def test_chat_adapter_signature_information():
+    """
+    This test ensures that the signature information sent to the LM follows an expected format.
+    """
+
+    class TestSignature(AlinGo-Prompt.Signature):
+        input1: str = AlinGo-Prompt.InputField(desc="String Input")
+        input2: int = AlinGo-Prompt.InputField(desc="Integer Input")
+        output: str = AlinGo-Prompt.OutputField(desc="String Output")
+
+    AlinGo-Prompt.configure(lm=AlinGo-Prompt.LM(model="openai/gpt-4o"), adapter=AlinGo-Prompt.ChatAdapter())
+    program = AlinGo-Prompt.Predict(TestSignature)
+
+    reply = make_response("[[ ## output ## ]]\nok\n\n[[ ## completed ## ]]")
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete", return_value=reply) as mock_completion:
+        program(input1="Test", input2=11)
+
+    mock_completion.assert_called_once()
+    request = mock_completion.call_args.args[0]
+
+    assert request.system
+    assert len(request.messages) == 1
+    assert request.messages[0].role == "user"
+
+    system_content = request.system
+    user_content = request.messages[0].text
+
+    assert "1. `input1` (str)" in system_content
+    assert "2. `input2` (int)" in system_content
+    assert "1. `output` (str)" in system_content
+    assert "[[ ## input1 ## ]]\n{input1}" in system_content
+    assert "[[ ## input2 ## ]]\n{input2}" in system_content
+    assert "[[ ## output ## ]]\n{output}" in system_content
+    assert "[[ ## completed ## ]]" in system_content
+
+    assert "[[ ## input1 ## ]]" in user_content
+    assert "[[ ## input2 ## ]]" in user_content
+    assert "[[ ## output ## ]]" in user_content
+    assert "[[ ## completed ## ]]" in user_content
+
+
+def test_chat_adapter_exception_raised_on_failure():
+    """
+    This test ensures that on an error, ChatAdapter raises an explicit exception.
+    """
+    signature = AlinGo-Prompt.make_signature("question->answer")
+    adapter = AlinGo-Prompt.ChatAdapter()
+    invalid_completion = "{'output':'mismatched value'}"
+    with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError, match=r"Adapter ChatAdapter failed to parse.*"):
+        adapter.parse(signature, invalid_completion)
+
+
+def test_chat_adapter_formats_image():
+    # Test basic image formatting
+    image = AlinGo-Prompt.Image(url="https://example.com/image.jpg")
+
+    class MySignature(AlinGo-Prompt.Signature):
+        image: AlinGo-Prompt.Image = AlinGo-Prompt.InputField()
+        text: str = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+    prompt = adapter.format(MySignature, [], {"image": image})
+
+    assert prompt.system
+    assert len(prompt.messages) == 1
+    parts = prompt.messages[0].parts
+
+    # The message should have 3 parts: text, image, text
+    assert len(parts) == 3
+    assert parts[0].type == "text"
+    assert parts[2].type == "text"
+
+    # Assert that the image is formatted correctly
+    assert parts[1] == ImagePart(url="https://example.com/image.jpg", media_type="image/jpeg")
+
+
+def test_chat_adapter_formats_image_with_few_shot_examples():
+    class MySignature(AlinGo-Prompt.Signature):
+        image: AlinGo-Prompt.Image = AlinGo-Prompt.InputField()
+        text: str = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+
+    demos = [
+        AlinGo-Prompt.Example(
+            image=AlinGo-Prompt.Image(url="https://example.com/image1.jpg"),
+            text="This is a test image",
+        ),
+        AlinGo-Prompt.Example(
+            image=AlinGo-Prompt.Image(url="https://example.com/image2.jpg"),
+            text="This is another test image",
+        ),
+    ]
+    prompt = adapter.format(MySignature, demos, {"image": AlinGo-Prompt.Image(url="https://example.com/image3.jpg")})
+
+    # 2 few shot examples (1 user and assistant message for each example), 1 user message
+    messages = prompt.messages
+    assert len(messages) == 5
+
+    assert "[[ ## completed ## ]]\n" in messages[1].text
+    assert "[[ ## completed ## ]]\n" in messages[3].text
+
+    assert ImagePart(url="https://example.com/image1.jpg", media_type="image/jpeg") in messages[0].parts
+    assert ImagePart(url="https://example.com/image2.jpg", media_type="image/jpeg") in messages[2].parts
+    assert ImagePart(url="https://example.com/image3.jpg", media_type="image/jpeg") in messages[4].parts
+
+
+def test_chat_adapter_formats_image_with_nested_images():
+    class ImageWrapper(pydantic.BaseModel):
+        images: list[AlinGo-Prompt.Image]
+        tag: list[str]
+
+    class MySignature(AlinGo-Prompt.Signature):
+        image: ImageWrapper = AlinGo-Prompt.InputField()
+        text: str = AlinGo-Prompt.OutputField()
+
+    image1 = AlinGo-Prompt.Image(url="https://example.com/image1.jpg")
+    image2 = AlinGo-Prompt.Image(url="https://example.com/image2.jpg")
+    image3 = AlinGo-Prompt.Image(url="https://example.com/image3.jpg")
+
+    image_wrapper = ImageWrapper(images=[image1, image2, image3], tag=["test", "example"])
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+    prompt = adapter.format(MySignature, [], {"image": image_wrapper})
+
+    parts = prompt.messages[0].parts
+    assert ImagePart(url="https://example.com/image1.jpg", media_type="image/jpeg") in parts
+    assert ImagePart(url="https://example.com/image2.jpg", media_type="image/jpeg") in parts
+    assert ImagePart(url="https://example.com/image3.jpg", media_type="image/jpeg") in parts
+
+
+def test_chat_adapter_formats_image_with_few_shot_examples_with_nested_images():
+    class ImageWrapper(pydantic.BaseModel):
+        images: list[AlinGo-Prompt.Image]
+        tag: list[str]
+
+    class MySignature(AlinGo-Prompt.Signature):
+        image: ImageWrapper = AlinGo-Prompt.InputField()
+        text: str = AlinGo-Prompt.OutputField()
+
+    image1 = AlinGo-Prompt.Image(url="https://example.com/image1.jpg")
+    image2 = AlinGo-Prompt.Image(url="https://example.com/image2.jpg")
+    image3 = AlinGo-Prompt.Image(url="https://example.com/image3.jpg")
+
+    image_wrapper = ImageWrapper(images=[image1, image2, image3], tag=["test", "example"])
+    demos = [
+        AlinGo-Prompt.Example(
+            image=image_wrapper,
+            text="This is a test image",
+        ),
+    ]
+
+    image_wrapper_2 = ImageWrapper(images=[AlinGo-Prompt.Image(url="https://example.com/image4.jpg")], tag=["test", "example"])
+    adapter = AlinGo-Prompt.ChatAdapter()
+    prompt = adapter.format(MySignature, demos, {"image": image_wrapper_2})
+
+    messages = prompt.messages
+    assert len(messages) == 3
+
+    # Image information in the few-shot example's user message
+    assert ImagePart(url="https://example.com/image1.jpg", media_type="image/jpeg") in messages[0].parts
+    assert ImagePart(url="https://example.com/image2.jpg", media_type="image/jpeg") in messages[0].parts
+    assert ImagePart(url="https://example.com/image3.jpg", media_type="image/jpeg") in messages[0].parts
+
+    # The query image is formatted in the last user message
+    assert ImagePart(url="https://example.com/image4.jpg", media_type="image/jpeg") in messages[-1].parts
+
+
+def test_chat_adapter_with_tool():
+    class MySignature(AlinGo-Prompt.Signature):
+        """Answer question with the help of the tools"""
+
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    def get_weather(city: str) -> str:
+        """Get the weather for a city"""
+        return f"The weather in {city} is sunny"
+
+    def get_population(country: str, year: int) -> str:
+        """Get the population for a country"""
+        return f"The population of {country} in {year} is 1000000"
+
+    tools = [AlinGo-Prompt.Tool(get_weather), AlinGo-Prompt.Tool(get_population)]
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+    prompt = adapter.format(MySignature, [], {"question": "What is the weather in Tokyo?", "tools": tools})
+
+    assert len(prompt.messages) == 1
+    user_text = prompt.messages[0].text
+
+    # The output field type description should be included in the system message even if the output field is nested
+    assert AlinGo-Prompt.ToolCalls.description() in prompt.system
+
+    # The user message should include the question and the tools
+    assert "What is the weather in Tokyo?" in user_text
+    assert "get_weather" in user_text
+    assert "get_population" in user_text
+
+    # Tool arguments format should be included in the user message
+    assert "{'city': {'type': 'string'}}" in user_text
+    assert "{'country': {'type': 'string'}, 'year': {'type': 'integer'}}" in user_text
+
+
+def test_chat_adapter_with_code():
+    # Test with code as input field
+    class CodeAnalysis(AlinGo-Prompt.Signature):
+        """Analyze the time complexity of the code"""
+
+        code: AlinGo-Prompt.Code = AlinGo-Prompt.InputField()
+        result: str = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+    prompt = adapter.format(CodeAnalysis, [], {"code": "print('Hello, world!')"})
+
+    assert len(prompt.messages) == 1
+
+    # The output field type description should be included in the system message even if the output field is nested
+    assert AlinGo-Prompt.Code.description() in prompt.system
+
+    # The user message should include the question and the tools
+    assert "print('Hello, world!')" in prompt.messages[0].text
+
+    # Test with code as output field
+    class CodeGeneration(AlinGo-Prompt.Signature):
+        """Generate code to answer the question"""
+
+        question: str = AlinGo-Prompt.InputField()
+        code: AlinGo-Prompt.Code = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        mock_completion.return_value = make_response(
+            '[[ ## code ## ]]\nprint("Hello, world!")',
+            model="openai/gpt-4o-mini",
+        )
+        result = adapter(
+            AlinGo-Prompt.LM(model="openai/gpt-4o-mini", cache=False),
+            {},
+            CodeGeneration,
+            [],
+            {"question": "Write a python program to print 'Hello, world!'"},
+        )
+        assert result[0]["code"].code == 'print("Hello, world!")'
+
+
+def test_code_output_field_omits_json_schema_in_prompt():
+    """Regression test for #9251: AlinGo-Prompt.Code should avoid duplicating large JSON schema text."""
+    class CodeGeneration(AlinGo-Prompt.Signature):
+        """Generate code to answer the question"""
+        question: str = AlinGo-Prompt.InputField()
+        code: AlinGo-Prompt.Code = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+    system_content = adapter.format(CodeGeneration, [], {"question": "Hello"}).system
+
+    assert AlinGo-Prompt.Code.description() in system_content
+    assert "JSON schema" not in system_content
+    assert '"properties"' not in system_content
+    assert "Code type in DSPy" not in system_content
+
+
+def test_citations_output_field_keeps_json_schema_in_prompt():
+    """Non-Code custom types should keep schema guidance for structured output reliability."""
+
+    class CitationGeneration(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        citations: Citations = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+    system_content = adapter.format(CitationGeneration, [], {"question": "Hello"}).system
+
+    assert "must adhere to the JSON schema" in system_content
+    assert "Type description of Citations" in system_content
+
+
+@pytest.mark.parametrize("adapter", [AlinGo-Prompt.ChatAdapter(), AlinGo-Prompt.JSONAdapter(), AlinGo-Prompt.XMLAdapter()])
+def test_history_replay_preserves_previous_request_prefix(adapter):
+    class Conversation(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    history = AlinGo-Prompt.History(messages=[])
+    previous = None
+    for question, answer in [("What is 3+4?", "7"), ("Double that?", "14"), ("Subtract five?", "9")]:
+        prompt = adapter.format(Conversation, [], {"question": question, "history": history})
+        if previous is not None:
+            assert prompt.system == previous.system
+            assert prompt.messages[:len(previous.messages)] == previous.messages
+        history.messages.append({"question": question, "answer": answer})
+        previous = prompt
+
+
+def test_chat_adapter_formats_conversation_history():
+    class MySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        history: AlinGo-Prompt.History = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    history = AlinGo-Prompt.History(
+        messages=[
+            {"question": "What is the capital of France?", "answer": "Paris"},
+            {"question": "What is the capital of Germany?", "answer": "Berlin"},
+        ]
+    )
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+    messages = adapter.format(MySignature, [], {"question": "What is the capital of France?", "history": history}).messages
+
+    assert len(messages) == 5
+    reminder = (
+        "\n\nRespond with the corresponding output fields, starting with the field `[[ ## answer ## ]]`, "
+        "and then ending with the marker for `[[ ## completed ## ]]`."
+    )
+    assert messages[0].text == "[[ ## question ## ]]\nWhat is the capital of France?" + reminder
+    assert messages[1].text == "[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]\n"
+    assert messages[2].text == "[[ ## question ## ]]\nWhat is the capital of Germany?" + reminder
+    assert messages[3].text == "[[ ## answer ## ]]\nBerlin\n\n[[ ## completed ## ]]\n"
+
+
+def test_chat_adapter_fallback_to_json_adapter_on_exception():
+    signature = AlinGo-Prompt.make_signature("question->answer")
+    adapter = AlinGo-Prompt.ChatAdapter()
+
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        # Mock returning a response compatible with JSONAdapter but not ChatAdapter
+        mock_completion.return_value = make_response(
+            "{'answer': 'Paris'}",
+            model="openai/gpt-4o-mini",
+        )
+
+        lm = AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False)
+
+        with mock.patch("AlinGo-Prompt.adapters.json_adapter.JSONAdapter.__call__") as mock_json_adapter_call:
+            adapter(lm, {}, signature, [], {"question": "What is the capital of France?"})
+            mock_json_adapter_call.assert_called_once()
+
+        # The parse should succeed
+        result = adapter(lm, {}, signature, [], {"question": "What is the capital of France?"})
+        assert result == [{"answer": "Paris"}]
+
+
+def test_chat_adapter_fallback_preserves_native_function_calling_flag():
+    signature = AlinGo-Prompt.make_signature("question->answer")
+    adapter = AlinGo-Prompt.ChatAdapter(use_native_function_calling=False)
+    seen = {}
+
+    def fake_json_adapter_call(self, lm, lm_kwargs, signature, demos, inputs):
+        seen["use_native_function_calling"] = self.use_native_function_calling
+        return [{"answer": "Paris"}]
+
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        mock_completion.return_value = make_response(
+            "nonsense",
+            model="openai/gpt-4o-mini",
+        )
+        lm = AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False)
+
+        with mock.patch("AlinGo-Prompt.adapters.json_adapter.JSONAdapter.__call__", new=fake_json_adapter_call):
+            result = adapter(lm, {}, signature, [], {"question": "What is the capital of France?"})
+
+    assert result == [{"answer": "Paris"}]
+    assert seen["use_native_function_calling"] is False
+
+
+def test_chat_adapter_respects_use_json_adapter_fallback_flag():
+    signature = AlinGo-Prompt.make_signature("question->answer")
+    adapter = AlinGo-Prompt.ChatAdapter(use_json_adapter_fallback=False)
+
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        mock_completion.return_value = make_response(
+            "nonsense",
+            model="openai/gpt-4o-mini",
+        )
+
+        lm = AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False)
+
+        with mock.patch("AlinGo-Prompt.adapters.json_adapter.JSONAdapter.__call__") as mock_json_adapter_call:
+            with pytest.raises(AlinGo-Prompt.utils.exceptions.AdapterParseError):
+                adapter(lm, {}, signature, [], {"question": "What is the capital of France?"})
+        mock_json_adapter_call.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_chat_adapter_fallback_to_json_adapter_on_exception_async():
+    signature = AlinGo-Prompt.make_signature("question->answer")
+    adapter = AlinGo-Prompt.ChatAdapter()
+
+    with mock.patch("AlinGo-Prompt.clients.engines.AsyncLM15Engine.complete") as mock_completion:
+        # Mock returning a response compatible with JSONAdapter but not ChatAdapter
+        mock_completion.return_value = make_response(
+            "{'answer': 'Paris'}",
+            model="openai/gpt-4o-mini",
+        )
+
+        lm = AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False)
+
+        with mock.patch("AlinGo-Prompt.adapters.json_adapter.JSONAdapter.acall") as mock_json_adapter_acall:
+            await adapter.acall(lm, {}, signature, [], {"question": "What is the capital of France?"})
+            mock_json_adapter_acall.assert_called_once()
+
+        # The parse should succeed
+        result = await adapter.acall(lm, {}, signature, [], {"question": "What is the capital of France?"})
+        assert result == [{"answer": "Paris"}]
+
+
+@pytest.mark.asyncio
+async def test_chat_adapter_async_fallback_preserves_native_function_calling_flag():
+    signature = AlinGo-Prompt.make_signature("question->answer")
+    adapter = AlinGo-Prompt.ChatAdapter(use_native_function_calling=False)
+    seen = {}
+
+    async def fake_json_adapter_acall(self, lm, lm_kwargs, signature, demos, inputs):
+        seen["use_native_function_calling"] = self.use_native_function_calling
+        return [{"answer": "Paris"}]
+
+    with mock.patch("AlinGo-Prompt.clients.engines.AsyncLM15Engine.complete") as mock_completion:
+        mock_completion.return_value = make_response(
+            "nonsense",
+            model="openai/gpt-4o-mini",
+        )
+        lm = AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False)
+
+        with mock.patch("AlinGo-Prompt.adapters.json_adapter.JSONAdapter.acall", new=fake_json_adapter_acall):
+            result = await adapter.acall(lm, {}, signature, [], {"question": "What is the capital of France?"})
+
+    assert result == [{"answer": "Paris"}]
+    assert seen["use_native_function_calling"] is False
+
+
+def test_chat_adapter_toolcalls_native_function_calling():
+    class MySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    def get_weather(city: str) -> str:
+        return f"The weather in {city} is sunny"
+
+    tools = [AlinGo-Prompt.Tool(get_weather)]
+
+    adapter = AlinGo-Prompt.JSONAdapter(use_native_function_calling=True)
+
+    # Case 1: Tool calls are present in the response, while content is None.
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        mock_completion.return_value = make_response(
+            tool_calls=[("call_pQm8ajtSMxgA0nrzK2ivFmxG", "get_weather", {"city": "Paris"})],
+            model="openai/gpt-4o-mini",
+        )
+        result = adapter(
+            AlinGo-Prompt.LM(model="openai/gpt-4o-mini", cache=False),
+            {},
+            MySignature,
+            [],
+            {"question": "What is the weather in Paris?", "tools": tools},
+        )
+
+        assert result[0]["tool_calls"] == AlinGo-Prompt.ToolCalls(
+            tool_calls=[
+                AlinGo-Prompt.ToolCalls.ToolCall(
+                    id="call_pQm8ajtSMxgA0nrzK2ivFmxG",
+                    name="get_weather",
+                    args={"city": "Paris"},
+                )
+            ]
+        )
+        # `answer` is not present, so we set it to None
+        assert result[0]["answer"] is None
+
+    # Case 2: Tool calls are not present in the response, while content is present.
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        mock_completion.return_value = make_response(
+            "{'answer': 'Paris'}",
+            model="openai/gpt-4o-mini",
+        )
+        result = adapter(
+            AlinGo-Prompt.LM(model="openai/gpt-4o-mini", cache=False),
+            {},
+            MySignature,
+            [],
+            {"question": "What is the weather in Paris?", "tools": tools},
+        )
+        assert result[0]["answer"] == "Paris"
+        assert result[0]["tool_calls"] is None
+
+
+def test_chat_adapter_toolcalls_vague_match():
+    class MySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    def get_weather(city: str) -> str:
+        return f"The weather in {city} is sunny"
+
+    tools = [AlinGo-Prompt.Tool(get_weather)]
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        # Case 1: tool_calls field is a list of dicts
+        mock_completion.return_value = make_response(
+            "[[ ## tool_calls ## ]]\n[{'name': 'get_weather', 'args': {'city': 'Paris'}]",
+            model="openai/gpt-4o-mini",
+        )
+        result = adapter(
+            AlinGo-Prompt.LM(model="openai/gpt-4o-mini", cache=False),
+            {},
+            MySignature,
+            [],
+            {"question": "What is the weather in Paris?", "tools": tools},
+        )
+        assert result[0]["tool_calls"] == AlinGo-Prompt.ToolCalls(
+            tool_calls=[AlinGo-Prompt.ToolCalls.ToolCall(name="get_weather", args={"city": "Paris"})]
+        )
+
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        # Case 2: tool_calls field is a single dict with "name" and "args" keys
+        mock_completion.return_value = make_response(
+            "[[ ## tool_calls ## ]]\n{'name': 'get_weather', 'args': {'city': 'Paris'}}",
+            model="openai/gpt-4o-mini",
+        )
+        result = adapter(
+            AlinGo-Prompt.LM(model="openai/gpt-4o-mini", cache=False),
+            {},
+            MySignature,
+            [],
+            {"question": "What is the weather in Paris?", "tools": tools},
+        )
+        assert result[0]["tool_calls"] == AlinGo-Prompt.ToolCalls(
+            tool_calls=[AlinGo-Prompt.ToolCalls.ToolCall(name="get_weather", args={"city": "Paris"})]
+        )
+
+
+@mock.patch.object(AlinGo-Prompt.LM, "supports_reasoning", new_callable=mock.PropertyMock, return_value=True)
+def test_chat_adapter_native_reasoning(_supports_reasoning):
+    class MySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        reasoning: AlinGo-Prompt.Reasoning = AlinGo-Prompt.OutputField()
+        answer: str = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        mock_completion.return_value = make_response(
+            "[[ ## answer ## ]]\nParis\n[[ ## completion ## ]]",
+            thinking="Step-by-step thinking about the capital of France",
+            model="anthropic/claude-3-7-sonnet-20250219",
+        )
+        modified_signature = adapter._call_preprocess(
+            AlinGo-Prompt.LM(model="anthropic/claude-3-7-sonnet-20250219", reasoning_effort="low", cache=False),
+            {},
+            MySignature,
+            {"question": "What is the capital of France?"},
+        )
+        assert "reasoning" not in modified_signature.output_fields
+
+        result = adapter(
+            AlinGo-Prompt.LM(model="anthropic/claude-3-7-sonnet-20250219", reasoning_effort="low", cache=False),
+            {},
+            MySignature,
+            [],
+            {"question": "What is the capital of France?"},
+        )
+        assert result[0]["reasoning"] == AlinGo-Prompt.Reasoning(content="Step-by-step thinking about the capital of France")
+
+
+def test_chat_adapter_parses_float_with_underscores():
+    """
+    This test verifies that ChatAdapter can parse float numbers with underscores.
+    After json-repair version 0.54.1, floats like "123_456.789" are treated as normal float numbers.
+    """
+
+    class Score(pydantic.BaseModel):
+        score: float
+
+    class MySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        score: Score = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+
+    # Simulate a response with a float number containing underscores
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete") as mock_completion:
+        mock_completion.return_value = make_response(
+            "[[ ## score ## ]]\n{'score': 123_456.789}\n[[ ## completed ## ]]",
+            model="openai/gpt-4o-mini",
+        )
+
+        lm = AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False)
+        result = adapter(lm, {}, MySignature, [], {"question": "What is the score?"})
+
+        # The underscore-separated float should be parsed as a normal float
+        assert result[0]["score"].score == 123456.789
+
+
+def test_format_system_message():
+    class MySignature(AlinGo-Prompt.Signature):
+        """Answer the question with multiple answers and scores"""
+
+        question: str = AlinGo-Prompt.InputField()
+        answers: list[str] = AlinGo-Prompt.OutputField()
+        scores: list[float] = AlinGo-Prompt.OutputField()
+
+    adapter = AlinGo-Prompt.ChatAdapter()
+    system_message = adapter.format_system_message(MySignature)
+    expected_system_message = """Your input fields are:
+1. `question` (str):
+Your output fields are:
+1. `answers` (list[str]):\x20
+2. `scores` (list[float]):
+All interactions will be structured in the following way, with the appropriate values filled in.
+
+[[ ## question ## ]]
+{question}
+
+[[ ## answers ## ]]
+{answers}        # note: the value you produce must adhere to the JSON schema: {"type": "array", "items": {"type": "string"}}
+
+[[ ## scores ## ]]
+{scores}        # note: the value you produce must adhere to the JSON schema: {"type": "array", "items": {"type": "number"}}
+
+[[ ## completed ## ]]
+In adhering to this structure, your objective is:\x20
+        Answer the question with multiple answers and scores"""
+    assert system_message == expected_system_message
+
+
+def test_null_content_raises_adapter_parse_error():
+    """When the LM returns content=None with no tool calls (e.g. content filter),
+    the adapter should raise AdapterParseError instead of silently returning None fields."""
+    from AlinGo-Prompt.lm15 import response_from_openai_chat
+    from AlinGo-Prompt.utils.exceptions import AdapterParseError
+
+    lm = AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False)
+    response = response_from_openai_chat({
+        "model": lm.model,
+        "choices": [{"message": {"role": "assistant", "content": None}, "finish_reason": "content_filter"}],
+    })
+
+    with AlinGo-Prompt.context(lm=lm):
+        with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete", return_value=response):
+            cot = AlinGo-Prompt.ChainOfThought("question -> answer")
+            with pytest.raises(AdapterParseError):
+                cot(question="test")
+
+
+def test_empty_string_content_raises_adapter_parse_error():
+    """Same as above but with empty string content."""
+    from AlinGo-Prompt.utils.exceptions import AdapterParseError
+
+    lm = AlinGo-Prompt.LM("openai/gpt-4o-mini", cache=False)
+    response = make_response("", model=lm.model)
+
+    with AlinGo-Prompt.context(lm=lm):
+        with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete", return_value=response):
+            cot = AlinGo-Prompt.ChainOfThought("question -> answer")
+            with pytest.raises(AdapterParseError):
+                cot(question="test")
+
+
+def test_tool_call_with_no_text_does_not_raise():
+    """Tool-call-only responses legitimately carry no text.
+    _call_postprocess must NOT raise when tool calls are present."""
+    adapter = AlinGo-Prompt.ChatAdapter(use_native_function_calling=True)
+    sig_cls = AlinGo-Prompt.Signature("question, tools: list[AlinGo-Prompt.Tool] -> answer, tool_calls: AlinGo-Prompt.ToolCalls")
+    response = make_response(tool_calls=[("call_1", "search", {"query": "test"})])
+
+    result = adapter._call_postprocess(sig_cls, sig_cls, [response])
+    assert result is not None
+    assert len(result) == 1
+    assert result[0]["tool_calls"].tool_calls[0].id == "call_1"
+
+
+def test_responses_model_native_tool_calling_round_trips_tool_only_output():
+    from AlinGo-Prompt.lm15 import FunctionTool
+
+    class MySignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        tools: list[AlinGo-Prompt.Tool] = AlinGo-Prompt.InputField()
+        tool_calls: AlinGo-Prompt.ToolCalls = AlinGo-Prompt.OutputField()
+
+    def search(query: str) -> str:
+        return query
+
+    api_response = make_response(tool_calls=[("call_1", "search", {"query": "cats"})])
+
+    adapter = AlinGo-Prompt.ChatAdapter(use_native_function_calling=True)
+    lm = AlinGo-Prompt.LM("openai/gpt-4o", model_type="responses", cache=False)
+
+    with mock.patch(
+        "AlinGo-Prompt.clients.engines.LM15Engine.complete", return_value=api_response
+    ) as responses:
+        result = adapter(lm, {}, MySignature, [], {"question": "find cats", "tools": [AlinGo-Prompt.Tool(search)]})
+
+    assert result == [
+        {"tool_calls": AlinGo-Prompt.ToolCalls(tool_calls=[AlinGo-Prompt.ToolCalls.ToolCall(id="call_1", name="search", args={"query": "cats"})])}
+    ]
+    assert responses.call_args.args[0].tools == (
+        FunctionTool(name="search", parameters={
+            "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"],
+        }),
+    )
+
+
+def test_tool_call_with_unstructured_content_does_not_raise():
+    """Provider tool calls are authoritative even when content is not adapter-formatted."""
+    adapter = AlinGo-Prompt.ChatAdapter(use_native_function_calling=True)
+    original_sig = AlinGo-Prompt.Signature(
+        "question, tools: list[AlinGo-Prompt.Tool] -> next_thought: AlinGo-Prompt.Reasoning, tool_calls: AlinGo-Prompt.ToolCalls"
+    )
+    processed_sig = original_sig.delete("tools").delete("tool_calls").delete("next_thought")
+    responses = [make_response(
+        "I'll search for that now.",
+        tool_calls=[("call_1", "search", {"query": "test"})],
+        thinking="I need a search result.",
+    )]
+
+    result = adapter._call_postprocess(processed_sig, original_sig, responses)
+
+    assert result[0]["tool_calls"].tool_calls[0].id == "call_1"
+    assert result[0]["next_thought"] == AlinGo-Prompt.Reasoning(content="I need a search result.")
+
+
+def test_tool_call_with_structured_content_preserves_other_outputs():
+    adapter = AlinGo-Prompt.ChatAdapter(use_native_function_calling=True)
+    original_sig = AlinGo-Prompt.Signature("question, tools: list[AlinGo-Prompt.Tool] -> answer, tool_calls: AlinGo-Prompt.ToolCalls")
+    processed_sig = original_sig.delete("tools").delete("tool_calls")
+    responses = [make_response(
+        "[[ ## answer ## ]]\nI should use a tool.\n\n[[ ## completed ## ]]",
+        tool_calls=[("call_1", "search", {"query": "test"})],
+    )]
+
+    result = adapter._call_postprocess(processed_sig, original_sig, responses)
+
+    assert result[0]["answer"] == "I should use a tool."
+    assert result[0]["tool_calls"].tool_calls[0].id == "call_1"
+
+
+def test_provider_tool_calls_preserve_id():
+    adapter = AlinGo-Prompt.ChatAdapter(use_native_function_calling=True)
+    sig_cls = AlinGo-Prompt.Signature("question, tools: list[AlinGo-Prompt.Tool] -> tool_calls: AlinGo-Prompt.ToolCalls")
+
+    responses = [make_response(tool_calls=[("call_from_responses", "search", {"query": "cats"})])]
+
+    result = adapter._call_postprocess(sig_cls, sig_cls, responses)
+
+    assert result[0]["tool_calls"] == AlinGo-Prompt.ToolCalls(
+        tool_calls=[
+            AlinGo-Prompt.ToolCalls.ToolCall(id="call_from_responses", name="search", args={"query": "cats"})
+        ]
+    )
+
+
+class OptionalOutputSignature(AlinGo-Prompt.Signature):
+    question: str = AlinGo-Prompt.InputField()
+    answer: str = AlinGo-Prompt.OutputField()
+    note: str | None = AlinGo-Prompt.OutputField(default="No note")
+    tags: list[str] = AlinGo-Prompt.OutputField(default_factory=list)
+    maybe: str | None = AlinGo-Prompt.OutputField()
+
+
+def test_missing_optional_output_fields_fall_back_to_defaults():
+    from AlinGo-Prompt.utils.dummies import DummyLM
+
+    with AlinGo-Prompt.context(lm=DummyLM([{"answer": "42"}]), adapter=AlinGo-Prompt.ChatAdapter()):
+        pred = AlinGo-Prompt.Predict(OptionalOutputSignature)(question="anything")
+
+    assert pred.answer == "42"
+    assert pred.note == "No note"
+    assert pred.tags == []
+    assert pred.maybe is None
+
+
+def test_output_field_default_is_overridden_by_lm_response():
+    from AlinGo-Prompt.utils.dummies import DummyLM
+
+    with AlinGo-Prompt.context(lm=DummyLM([{"answer": "42", "note": "hello", "tags": '["a"]', "maybe": "yes"}]),
+                      adapter=AlinGo-Prompt.ChatAdapter()):
+        pred = AlinGo-Prompt.Predict(OptionalOutputSignature)(question="anything")
+
+    assert pred.note == "hello"
+    assert pred.tags == ["a"]
+    assert pred.maybe == "yes"
+
+
+def test_missing_required_output_field_still_raises():
+    from AlinGo-Prompt.utils.dummies import DummyLM
+    from AlinGo-Prompt.utils.exceptions import AdapterParseError
+
+    # Two identical responses: ChatAdapter retries via the JSONAdapter fallback before raising.
+    responses = [{"note": "present"}, {"note": "present"}]
+    with AlinGo-Prompt.context(lm=DummyLM(responses), adapter=AlinGo-Prompt.ChatAdapter()):
+        with pytest.raises(AdapterParseError):
+            AlinGo-Prompt.Predict(OptionalOutputSignature)(question="anything")
+
+
+def test_optional_type_syntax_output_fields_fall_back_to_defaults():
+    from typing import Optional
+
+    from AlinGo-Prompt.utils.dummies import DummyLM
+
+    class OptionalSyntaxSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        note: Optional[str] = AlinGo-Prompt.OutputField(default="No note")  # noqa: UP045
+        maybe: Optional[str] = AlinGo-Prompt.OutputField()  # noqa: UP045
+
+    with AlinGo-Prompt.context(lm=DummyLM([{"answer": "42"}]), adapter=AlinGo-Prompt.ChatAdapter()):
+        pred = AlinGo-Prompt.Predict(OptionalSyntaxSignature)(question="anything")
+
+    assert pred.answer == "42"
+    assert pred.note == "No note"
+    assert pred.maybe is None
+
+
+def test_optional_type_syntax_missing_required_output_field_still_raises():
+    from typing import Optional
+
+    from AlinGo-Prompt.utils.dummies import DummyLM
+    from AlinGo-Prompt.utils.exceptions import AdapterParseError
+
+    class OptionalSyntaxSignature(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: str = AlinGo-Prompt.OutputField()
+        note: Optional[str] = AlinGo-Prompt.OutputField(default="No note")  # noqa: UP045
+        maybe: Optional[str] = AlinGo-Prompt.OutputField()  # noqa: UP045
+
+    responses = [{"note": "present"}, {"maybe": "present"}]
+    with AlinGo-Prompt.context(lm=DummyLM(responses), adapter=AlinGo-Prompt.ChatAdapter()):
+        with pytest.raises(AdapterParseError):
+            AlinGo-Prompt.Predict(OptionalSyntaxSignature)(question="anything")
+
+
+def test_chat_adapter_formats_pep604_union_like_typing_union():
+    class QA(AlinGo-Prompt.Signature):
+        question: str = AlinGo-Prompt.InputField()
+        answer: int | None = AlinGo-Prompt.OutputField()
+
+    messages = AlinGo-Prompt.ChatAdapter().format(QA, [], {"question": "How many?"})
+
+    assert "1. `answer` (Union[int, NoneType])" in messages.system
+    assert "must be formatted as a valid Python Union[int, NoneType]" in messages.messages[-1].text
+    assert "UnionType" not in messages.system + messages.messages[-1].text

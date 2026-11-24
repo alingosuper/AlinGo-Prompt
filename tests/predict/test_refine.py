@@ -1,0 +1,116 @@
+import pytest
+
+import AlinGo-Prompt
+from AlinGo-Prompt.predict.predict import Predict
+from AlinGo-Prompt.predict.refine import Refine
+from AlinGo-Prompt.primitives.prediction import Prediction
+from AlinGo-Prompt.utils.dummies import DummyLM
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("reasoning_type", [AlinGo-Prompt.Reasoning, str])
+def test_refine_feedback_preserves_reasoning(native, reasoning_type):
+    from AlinGo-Prompt.lm15 import Message, Response, TextPart, ThinkingPart, Usage
+
+    feedback = []
+    answers = iter(["wrong", "correct"])
+
+    class Engine:
+        supports_reasoning = native
+
+        def complete(self, request):
+            if "program_trajectory" in request.system:
+                feedback.append("\n".join(message.text for message in request.messages))
+                text = '[[ ## discussion ## ]]\nFix division\n[[ ## advice ## ]]\n{"predict": "Divide by three"}'
+                parts = []
+            else:
+                reasoning = "used-seven-instead-of-three"
+                name = "plan" if "[[ ## plan ## ]]" in request.system else "reasoning"
+                text = f"[[ ## {name} ## ]]\n{reasoning}\n" if f"[[ ## {name} ## ]]" in request.system else ""
+                text += f"[[ ## answer ## ]]\n{next(answers)}"
+                parts = [ThinkingPart(reasoning)] if native else []
+            return Response(None, request.model, Message.assistant(parts + [TextPart(text)]), "stop", Usage())
+
+    cot = AlinGo-Prompt.ChainOfThought("question -> answer", rationale_field_type=reasoning_type)
+    lm = AlinGo-Prompt.LM("custom/refine", engine=Engine(), cache=False)
+    with AlinGo-Prompt.context(lm=lm, adapter=AlinGo-Prompt.ChatAdapter(use_json_adapter_fallback=False)):
+        result = AlinGo-Prompt.Refine(cot, N=2, reward_fn=lambda _, p: float(p.answer == "correct"), threshold=1)(
+            question="Divide 21 by 3"
+        )
+    assert result.answer == "correct"
+    assert len(feedback) == 1
+    # Both the trace and final program output must retain the failed reasoning.
+    assert feedback[0].count("used-seven-instead-of-three") == 2
+
+
+class DummyModule(AlinGo-Prompt.Module):
+    def __init__(self, signature, forward_fn):
+        super().__init__()
+        self.predictor = Predict(signature)
+        self.forward_fn = forward_fn
+
+    def forward(self, **kwargs) -> Prediction:
+        return self.forward_fn(self, **kwargs)
+
+
+def test_refine_forward_success_first_attempt():
+    lm = DummyLM([{"answer": "Brussels"}, {"answer": "City of Brussels"}, {"answer": "Brussels"}])
+    AlinGo-Prompt.configure(lm=lm)
+    module_call_count = [0]
+
+    def count_calls(self, **kwargs):
+        module_call_count[0] += 1
+        return self.predictor(**kwargs)
+
+    reward_call_count = [0]
+
+    def reward_fn(kwargs, pred: Prediction) -> float:
+        reward_call_count[0] += 1
+        # The answer should always be one word.
+        return 1.0 if len(pred.answer) == 1 else 0.0
+
+    predict = DummyModule("question -> answer", count_calls)
+
+    refine = Refine(module=predict, N=3, reward_fn=reward_fn, threshold=1.0)
+    result = refine(question="What is the capital of Belgium?")
+
+    assert result.answer == "Brussels", "Result should be `Brussels`"
+    assert reward_call_count[0] > 0, "Reward function should have been called"
+    assert module_call_count[0] == 3, (
+        "Module should have been called exactly 3 times, but was called %d times" % module_call_count[0]
+    )
+
+
+def test_refine_module_default_fail_count():
+    lm = DummyLM([{"answer": "Brussels"}, {"answer": "City of Brussels"}, {"answer": "Brussels"}])
+    AlinGo-Prompt.configure(lm=lm)
+
+    def always_raise(self, **kwargs):
+        raise ValueError("Deliberately failing")
+
+    predict = DummyModule("question -> answer", always_raise)
+
+    refine = Refine(module=predict, N=3, reward_fn=lambda _, __: 1.0, threshold=0.0)
+    with pytest.raises(ValueError):
+        refine(question="What is the capital of Belgium?")
+
+
+def test_refine_module_custom_fail_count():
+    lm = DummyLM([{"answer": "Brussels"}, {"answer": "City of Brussels"}, {"answer": "Brussels"}])
+    AlinGo-Prompt.configure(lm=lm)
+    module_call_count = [0]
+
+    def raise_on_second_call(self, **kwargs):
+        if module_call_count[0] < 2:
+            module_call_count[0] += 1
+            raise ValueError("Deliberately failing")
+        return self.predictor(**kwargs)
+
+    predict = DummyModule("question -> answer", raise_on_second_call)
+
+    refine = Refine(module=predict, N=3, reward_fn=lambda _, __: 1.0, threshold=0.0, fail_count=1)
+    with pytest.raises(ValueError):
+        refine(question="What is the capital of Belgium?")
+    assert module_call_count[0] == 2, (
+        "Module should have been called exactly 2 times, but was called %d times" % module_call_count[0]
+    )

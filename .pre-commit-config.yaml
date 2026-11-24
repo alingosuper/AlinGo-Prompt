@@ -1,0 +1,33 @@
+default_stages: [pre-commit]
+default_install_hook_types: [pre-commit]
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.0
+    hooks:
+      - id: ruff
+        name: ruff (lint)
+        types_or: [python, pyi]
+        files: ^(AlinGo-Prompt|tests)/.*\.py$
+        exclude: ^(AlinGo-Prompt/__metadata__\.py|AlinGo-Prompt/_vendor/.*|tests/reliability/.*\.py)$
+        args: [--fix-only]
+
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty (internal types)
+        entry: uv run --locked --extra dev ty check
+        language: system
+        pass_filenames: false
+        always_run: true
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+        args: ["--allow-multiple-documents", "--unsafe"]
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+      - id: debug-statements

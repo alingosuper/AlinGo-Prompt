@@ -1,0 +1,1131 @@
+import asyncio
+import json
+from collections import defaultdict
+from copy import deepcopy
+from decimal import Decimal
+from fractions import Fraction
+from typing import Annotated, Any, Optional
+
+import pytest
+from jsonschema import ValidationError, validate
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    Json,
+    RootModel,
+    TypeAdapter,
+    field_serializer,
+    model_serializer,
+    model_validator,
+)
+
+import AlinGo-Prompt
+from AlinGo-Prompt.adapters.types.tool import Tool, ToolCallResults, ToolCalls, convert_input_schema_to_tool_args
+from AlinGo-Prompt.clients.lm15_boundary import request_kwargs
+from AlinGo-Prompt.lm15 import Message, Request, ToolResultPart, tool_result
+
+
+# Test fixtures
+def dummy_function(x: int, y: str = "hello") -> str:
+    """A dummy function for testing.
+
+    Args:
+        x: An integer parameter
+        y: A string parameter
+    """
+    return f"{y} {x}"
+
+
+class DummyModel(BaseModel):
+    field1: str = "hello"
+    field2: int
+
+
+def dummy_with_pydantic(model: DummyModel) -> str:
+    """A dummy function that accepts a Pydantic model."""
+    return f"{model.field1} {model.field2}"
+
+
+class Address(BaseModel):
+    street: str
+    city: str
+    zip_code: str
+    is_primary: bool = False
+
+
+class ContactInfo(BaseModel):
+    email: str
+    phone: str | None = None
+    addresses: list[Address]
+
+
+class UserProfile(BaseModel):
+    user_id: int
+    name: str
+    age: int | None = None
+    contact: ContactInfo
+    tags: list[str] = []
+
+
+class Note(BaseModel):
+    content: str
+    author: str
+
+
+def complex_dummy_function(profile: UserProfile, priority: int, notes: list[Note] | None = None) -> dict[str, Any]:
+    """Process user profile with complex nested structure.
+
+    Args:
+        profile: User profile containing nested contact and address information
+        priority: Priority level of the processing
+        notes: Optional processing notes
+    """
+    primary_address = next(
+        (addr for addr in profile.contact.addresses if addr.is_primary), profile.contact.addresses[0]
+    )
+
+    return {
+        "user_id": profile.user_id,
+        "name": profile.name,
+        "priority": priority,
+        "primary_address": primary_address.model_dump(),
+        "notes": notes,
+    }
+
+
+async def async_dummy_function(x: int, y: str = "hello") -> str:
+    """An async dummy function for testing.
+
+    Args:
+        x: An integer parameter
+        y: A string parameter
+    """
+    await asyncio.sleep(0.1)  # Simulate some async work
+    return f"{y} {x}"
+
+
+async def async_dummy_with_pydantic(model: DummyModel) -> str:
+    """An async dummy function that accepts a Pydantic model."""
+    await asyncio.sleep(0.1)  # Simulate some async work
+    return f"{model.field1} {model.field2}"
+
+
+async def async_complex_dummy_function(
+    profile: UserProfile,
+    priority: int,
+    notes: list[Note] | None = None,
+) -> dict[str, Any]:
+    """Process user profile with complex nested structure asynchronously.
+
+    Args:
+        profile: User profile containing nested contact and address information
+        priority: Priority level of the processing
+        notes: Optional processing notes
+    """
+    # Simulate some async processing work
+    await asyncio.sleep(0.1)
+
+    primary_address = next(
+        (addr for addr in profile.contact.addresses if addr.is_primary), profile.contact.addresses[0]
+    )
+
+    # Simulate more async work after finding primary address
+    await asyncio.sleep(0.1)
+
+    return {
+        "user_id": profile.user_id,
+        "name": profile.name,
+        "priority": priority,
+        "primary_address": primary_address.model_dump(),
+        "notes": notes,
+    }
+
+
+def test_basic_initialization():
+    tool = Tool(name="test_tool", desc="A test tool", args={"param1": {"type": "string"}}, func=lambda x: x)
+    assert tool.name == "test_tool"
+    assert tool.desc == "A test tool"
+    assert tool.args == {"param1": {"type": "string"}}
+    assert callable(tool.func)
+
+
+def test_tool_from_function():
+    tool = Tool(dummy_function)
+
+    assert tool.name == "dummy_function"
+    assert "A dummy function for testing" in tool.desc
+    assert "x" in tool.args
+    assert "y" in tool.args
+    assert tool.args["x"]["type"] == "integer"
+    assert tool.args["y"]["type"] == "string"
+    assert tool.args["y"]["default"] == "hello"
+
+
+def test_tool_accepts_custom_type_instances_for_custom_type_args():
+    def caption(image: AlinGo-Prompt.Image, prefix: str) -> str:
+        return f"{prefix}: {image.url}"
+
+    image = AlinGo-Prompt.Image("https://example.com/cat.png")
+
+    assert Tool(caption)(image=image, prefix="cat") == "cat: https://example.com/cat.png"
+
+    def count(images: list[AlinGo-Prompt.Image]) -> int:
+        return len(images)
+
+    assert Tool(count)(images=[image, image]) == 2
+    with pytest.raises(ValueError):
+        Tool(count)(images=[image, 3])
+
+    from AlinGo-Prompt.adapters.types.decision import Noul
+
+    def judge(verdict: Noul) -> bool:
+        return verdict.value
+
+    assert Tool(judge)(verdict=Noul(value=True, confidence=0.7)) is True  # its hidden probability field is not checked
+
+    class Labeled(AlinGo-Prompt.Type):
+        label: str = Field(validation_alias="wire_label")
+        tag: str = Field(validation_alias=AliasChoices("wire_tag", "tag_name"))
+
+        def format(self):
+            return self.label
+
+    def read(item: Labeled) -> str:
+        return f"{item.label}/{item.tag}"
+
+    # The schema requires the validation aliases, so the fields are checked under those names.
+    assert Tool(read)(item=Labeled(wire_label="a", wire_tag="b")) == "a/b"
+
+    https_only = {"type": "object", "properties": {"url": {"type": "string", "pattern": "^https://"}}}
+    restricted = Tool(caption, args={"image": https_only, "prefix": {"type": "string"}})
+    with pytest.raises(ValueError, match="does not match"):
+        restricted(image=AlinGo-Prompt.Image("http://example.com/cat.png"), prefix="cat")
+
+
+def test_tool_defaults_are_json_serializable():
+    import datetime
+    import enum
+    import json
+    from decimal import Decimal
+
+    class Unit(enum.Enum):
+        CELSIUS = "celsius"
+        FAHRENHEIT = "fahrenheit"
+
+    def forecast(
+        city: str,
+        unit: Unit = Unit.CELSIUS,
+        start: datetime.date = datetime.date(2026, 1, 2),
+        price: Decimal = Decimal("1.5"),
+        factor: float = Decimal("0.1"),
+    ) -> str:
+        return city
+
+    tool = Tool(forecast)
+    assert tool.args["unit"]["default"] == "celsius"
+    assert tool.args["start"]["default"] == "2026-01-02"
+    assert tool.args["price"]["default"] == 1.5
+    assert tool.args["factor"]["default"] == 0.1
+    assert tool(city="x", price=tool.args["price"]["default"], factor=tool.args["factor"]["default"]) == "x"
+    json.dumps(tool.as_function_tool().parameters)
+
+
+def test_tool_defaults_without_json_form_are_kept():
+    def scale(data: bytes = b"\xff") -> str:
+        return "ok"
+
+    tool = Tool(scale)
+    assert tool.args["data"]["default"] == b"\xff"
+
+
+def test_tool_checks_custom_type_fields_as_json_and_leaves_other_values_alone():
+    import datetime
+    from decimal import Decimal
+
+    class Visit(AlinGo-Prompt.Type):
+        day: datetime.date
+        tags: set[str]
+
+    def describe(visit: Visit, amount: float, note) -> str:
+        return f"{visit.day.isoformat()} {sorted(visit.tags)} {amount} {type(note).__name__}"
+
+    class Note:
+        pass
+
+    visit = Visit(day=datetime.date(2026, 11, 4), tags={"x"})
+    assert Tool(describe)(visit=visit, amount=Decimal("1.5"), note=Note()) == "2026-11-04 ['x'] 1.5 Note"
+
+
+def test_as_function_tool_excludes_defaulted_args_from_required():
+    # `x` has no default and must be required; `y` has a default and must be optional.
+    tool = Tool(dummy_function)
+
+    function_tool = tool.as_function_tool()
+    assert function_tool.name == "dummy_function"
+    parameters = function_tool.parameters
+
+    assert parameters["required"] == ["x"]
+    assert "y" not in parameters["required"]
+    # The default is still advertised on the property itself.
+    assert parameters["properties"]["y"]["default"] == "hello"
+
+
+@pytest.mark.parametrize("resource_id", [None, "https://example.invalid/argument"])
+def test_as_function_tool_preserves_schema_scopes_and_literals(resource_id):
+    literal = {"$ref": "#/literal"}
+    schema = {
+        "type": "object",
+        "$defs": {"Value": {"type": "integer"}},
+        "properties": {
+            "number": {"$ref": "#/$defs/Value"},
+            "literal": {"const": literal, "default": literal, "examples": [literal]},
+        },
+    }
+    if resource_id:
+        schema["$id"] = resource_id
+    args = {"a~/b%": schema}
+    original = deepcopy(args)
+    tool = Tool(lambda **kwargs: kwargs, args=args)
+    value = {"a~/b%": {"number": 7, "literal": literal}}
+    for _ in range(2):
+        parameters = tool.as_function_tool().parameters
+        validate(value, parameters)
+        with pytest.raises(ValidationError):
+            validate({"a~/b%": {"number": "wrong", "literal": literal}}, parameters)
+        assert parameters["properties"]["a~/b%"]["properties"]["literal"] == schema["properties"]["literal"]
+        assert tool(**value) == value
+        assert tool.args == original
+
+
+def test_as_function_tool_preserves_recursive_argument_scopes():
+    class Node(BaseModel):
+        value: int
+        children: list["Node"] = []
+
+    schema = Node.model_json_schema()
+    root_schema = {"type": "object", "properties": {"child": {"$ref": "#"}}}
+    tool = Tool(lambda **kwargs: kwargs, args={"tree": schema, "other": root_schema})
+    parameters = tool.as_function_tool().parameters
+    validate({"tree": {"value": 7, "children": [{"value": 2}]}, "other": {"child": {"child": {}}}}, parameters)
+    with pytest.raises(ValidationError):
+        validate({"tree": {"value": 7, "children": [{"value": "wrong"}]}, "other": {}}, parameters)
+    assert tool.args == {"tree": schema, "other": root_schema}
+
+
+def test_tool_from_class():
+    class Foo:
+        def __init__(self, user_id: str):
+            self.user_id = user_id
+
+        def __call__(self, a: int, b: int) -> int:
+            """Add two numbers."""
+            return a + b
+
+    tool = Tool(Foo("123"))
+    assert tool.name == "Foo"
+    assert tool.desc == "Add two numbers."
+    assert tool.args == {"a": {"type": "integer"}, "b": {"type": "integer"}}
+
+
+def test_tool_from_function_with_pydantic():
+    tool = Tool(dummy_with_pydantic)
+
+    assert tool.name == "dummy_with_pydantic"
+    assert "model" in tool.args
+    assert tool.args["model"]["type"] == "object"
+    assert "field1" in tool.args["model"]["properties"]
+    assert "field2" in tool.args["model"]["properties"]
+    assert tool.args["model"]["properties"]["field1"]["default"] == "hello"
+
+
+def test_tool_from_function_with_pydantic_nesting():
+    tool = Tool(complex_dummy_function)
+
+    assert tool.name == "complex_dummy_function"
+
+    assert "profile" in tool.args
+    assert "priority" in tool.args
+    assert "notes" in tool.args
+    assert tool.args["profile"]["type"] == "object"
+    assert tool.args["profile"]["properties"]["user_id"]["type"] == "integer"
+    assert tool.args["profile"]["properties"]["name"]["type"] == "string"
+    assert tool.args["profile"]["properties"]["age"]["anyOf"] == [{"type": "integer"}, {"type": "null"}]
+    assert tool.args["profile"]["properties"]["contact"]["type"] == "object"
+    assert tool.args["profile"]["properties"]["contact"]["properties"]["email"]["type"] == "string"
+
+    # Reference should be resolved for nested pydantic models
+    assert "$defs" not in str(tool.args["notes"])
+    assert tool.args["notes"]["anyOf"][0]["type"] == "array"
+    assert tool.args["notes"]["anyOf"][0]["items"]["type"] == "object"
+    assert tool.args["notes"]["anyOf"][0]["items"]["properties"]["content"]["type"] == "string"
+    assert tool.args["notes"]["anyOf"][0]["items"]["properties"]["author"]["type"] == "string"
+
+
+def test_tool_callable():
+    tool = Tool(dummy_function)
+    result = tool(x=42, y="hello")
+    assert result == "hello 42"
+
+
+def test_tool_with_pydantic_callable():
+    tool = Tool(dummy_with_pydantic)
+    model = DummyModel(field1="test", field2=123)
+    result = tool(model=model)
+    assert result == "test 123"
+
+
+def test_tool_checks_plain_model_args_as_the_json_their_schema_describes():
+    import datetime
+
+    class Row(BaseModel):
+        model_config = ConfigDict(ser_json_bytes="hex")
+        label: str = Field(alias="wire_label")
+        note: str = Field(serialization_alias="wire_note")
+        box: tuple[int, int]
+        day: datetime.date
+        meta: Json[dict[str, int]]
+        qty: int
+        raw: bytes
+
+        @field_serializer("qty", when_used="json")
+        def _qty_label(self, qty: int) -> str:
+            return f"{qty} units"
+
+    def describe(row: Row, tags: set[str]) -> str:
+        return f"{row.label} {row.note} {row.box} {row.day.isoformat()} {sorted(tags)} {row.meta} {row.qty}"
+
+    row = Row(wire_label="a", note="n", box=(1, 2), day=datetime.date(2026, 11, 4), meta='{"k": 1}', qty=3, raw=b"\xff")
+    assert Tool(describe)(row=row, tags={"x"}) == "a n (1, 2) 2026-11-04 ['x'] {'k': 1} 3"
+
+    class Counts(RootModel[list[int]]):
+        pass
+
+    class Tagged(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+    def total(counts: Counts, tagged: Tagged) -> str:
+        return f"{sum(counts.root)} {tagged.source}"
+
+    args = {"counts": {"type": "array"}, "tagged": {"type": "object", "required": ["source"]}}
+    tool = Tool(total, args=args, arg_types={"counts": Counts, "tagged": Tagged})
+    assert tool(counts=Counts([1, 2]), tagged=Tagged(source="web")) == "3 web"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("as_json", [False, True])
+def test_tool_root_model_date_argument(asynchronous, as_json):
+    from datetime import date
+
+    class Day(RootModel[date]):
+        @model_serializer
+        def serialize(self):
+            return self.root.isoformat()
+
+    def read_day(value: Day) -> str:
+        return value.root.isoformat()
+
+    tool = AlinGo-Prompt.Tool(read_day)
+    value = "2026-11-09" if as_json else Day(date(2026, 11, 9))
+    result = asyncio.run(tool.acall(value=value)) if asynchronous else tool(value=value)
+    assert result == "2026-11-09"
+
+
+def test_tool_root_model_validates_root_not_custom_serializer():
+    class Count(RootModel[int]):
+        @model_serializer
+        def serialize(self):
+            return 0
+
+    def read_count(value: Count) -> int:
+        return value.root
+
+    tool = AlinGo-Prompt.Tool(read_count, args={"value": {"type": "integer", "maximum": 3}})
+    assert tool(value=Count(2)) == 2
+    with pytest.raises(ValueError, match="greater than the maximum"):
+        tool(value=Count(4))
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("number", [Decimal("2.75"), Fraction(1, 2)])
+def test_tool_root_model_preserves_numeric_constraints(asynchronous, number):
+    class Amount(RootModel[type(number)]):
+        pass
+
+    def read_amount(value: Amount):
+        return value.root
+
+    tool = AlinGo-Prompt.Tool(read_amount, args={"value": {"type": "number", "maximum": 3}})
+    value = Amount(number)
+    result = asyncio.run(tool.acall(value=value)) if asynchronous else tool(value=value)
+    assert result == number
+
+    class Amounts(RootModel[list[Annotated[Decimal, Field(le=3)]]]):
+        pass
+
+    def read_amounts(value: Amounts):
+        return value.root
+
+    tool = AlinGo-Prompt.Tool(read_amounts)
+    value = Amounts([Decimal(2)])
+    value.root.append(Decimal(4))
+    with pytest.raises(ValueError, match="Arg value is invalid"):
+        asyncio.run(tool.acall(value=value)) if asynchronous else tool(value=value)
+
+
+def test_invalid_function_call():
+    tool = Tool(dummy_function)
+    with pytest.raises(ValueError):
+        tool(x="not an integer", y="hello")
+
+
+def test_parameter_desc():
+    tool = Tool(dummy_function, arg_desc={"x": "The x parameter"})
+    assert tool.args["x"]["description"] == "The x parameter"
+
+
+def test_tool_with_default_args_without_type_hints():
+    def foo(x=100):
+        return x
+
+    tool = Tool(foo)
+    assert tool.args["x"]["default"] == 100
+    assert not hasattr(tool.args["x"], "type")
+
+
+def test_tool_call_parses_args():
+    tool = Tool(dummy_with_pydantic)
+
+    args = {
+        "model": {
+            "field1": "hello",
+            "field2": 123,
+        }
+    }
+
+    result = tool(**args)
+    assert result == "hello 123"
+
+
+def test_tool_call_parses_nested_list_of_pydantic_model():
+    def dummy_function(x: list[list[DummyModel]]):
+        return x
+
+    tool = Tool(dummy_function)
+    args = {
+        "x": [
+            [
+                {
+                    "field1": "hello",
+                    "field2": 123,
+                }
+            ]
+        ]
+    }
+
+    result = tool(**args)
+    assert result == [[DummyModel(field1="hello", field2=123)]]
+
+
+def test_tool_call_reads_json_arguments_as_json_and_validates_instances():
+    class Window(BaseModel):
+        model_config = ConfigDict(strict=True)
+        span: tuple[int, int]
+        runs: int = 0
+
+        @model_validator(mode="after")
+        def _ordered(self):
+            if self.span[0] > self.span[1]:
+                raise ValueError("start after end")
+            self.runs += 1
+            return self
+
+    def widths(windows: list[Window], spare: Window | None = None) -> list[tuple[int, int]]:
+        return [(w.span[1] - w.span[0], w.runs) for w in windows + ([spare] if spare else [])]
+
+    tool = Tool(widths)
+    # JSON data, as an LM or a sandbox sends: a strict tuple comes as a list, and each model is validated once.
+    assert tool(windows=[{"span": [2, 9]}], spare={"span": [1, 4]}) == [(7, 1), (3, 1)]
+    # A model instance is validated as given, so a change that breaks its validator is still caught.
+    window = Window(span=(2, 9))
+    window.span = (9, 1)
+    with pytest.raises(ValueError, match="start after end"):
+        tool(windows=[window])
+
+    # A Python container that only looks like JSON, such as a defaultdict, keeps its own behavior.
+    def missing(counts: defaultdict[str, int]) -> int:
+        return counts["present"] + counts["absent"]
+
+    assert Tool(missing)(counts=defaultdict(lambda: 7, present=3)) == 10
+
+
+def test_tool_call_kwarg():
+    def fn(x: int, **kwargs):
+        return kwargs
+
+    tool = Tool(fn)
+
+    assert tool(x=1, y=2, z=3) == {"y": 2, "z": 3}
+
+
+def test_tool_str():
+    def add(x: int, y: int = 0) -> int:
+        """Add two integers."""
+        return x + y
+
+    tool = Tool(add)
+    assert (
+        str(tool)
+        == "add, whose description is <desc>Add two integers.</desc>. It takes arguments {'x': {'type': 'integer'}, 'y': {'type': 'integer', 'default': 0}}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_tool_from_function():
+    tool = Tool(async_dummy_function)
+
+    assert tool.name == "async_dummy_function"
+    assert "An async dummy function for testing" in tool.desc
+    assert "x" in tool.args
+    assert "y" in tool.args
+    assert tool.args["x"]["type"] == "integer"
+    assert tool.args["y"]["type"] == "string"
+    assert tool.args["y"]["default"] == "hello"
+
+    # Test async call
+    result = await tool.acall(x=42, y="hello")
+    assert result == "hello 42"
+
+
+@pytest.mark.asyncio
+async def test_async_tool_with_pydantic():
+    tool = Tool(async_dummy_with_pydantic)
+
+    assert tool.name == "async_dummy_with_pydantic"
+    assert "model" in tool.args
+    assert tool.args["model"]["type"] == "object"
+    assert "field1" in tool.args["model"]["properties"]
+    assert "field2" in tool.args["model"]["properties"]
+
+    # Test async call with pydantic model
+    model = DummyModel(field1="test", field2=123)
+    result = await tool.acall(model=model)
+    assert result == "test 123"
+
+    # Test async call with dict
+    result = await tool.acall(model={"field1": "test", "field2": 123})
+    assert result == "test 123"
+
+
+@pytest.mark.asyncio
+async def test_async_tool_with_complex_pydantic():
+    tool = Tool(async_complex_dummy_function)
+
+    profile = UserProfile(
+        user_id=1,
+        name="Test User",
+        contact=ContactInfo(
+            email="test@example.com",
+            addresses=[
+                Address(street="123 Main St", city="Test City", zip_code="12345", is_primary=True),
+                Address(street="456 Side St", city="Test City", zip_code="12345"),
+            ],
+        ),
+    )
+
+    result = await tool.acall(profile=profile, priority=1, notes=[Note(content="Test note", author="Test author")])
+    assert result["user_id"] == 1
+    assert result["name"] == "Test User"
+    assert result["priority"] == 1
+    assert result["notes"] == [Note(content="Test note", author="Test author")]
+    assert result["primary_address"]["street"] == "123 Main St"
+
+
+@pytest.mark.asyncio
+async def test_async_tool_invalid_call():
+    tool = Tool(async_dummy_function)
+    with pytest.raises(ValueError):
+        await tool.acall(x="not an integer", y="hello")
+
+
+@pytest.mark.asyncio
+async def test_async_tool_with_kwargs():
+    async def fn(x: int, **kwargs):
+        return kwargs
+
+    tool = Tool(fn)
+
+    result = await tool.acall(x=1, y=2, z=3)
+    assert result == {"y": 2, "z": 3}
+
+
+@pytest.mark.asyncio
+async def test_async_concurrent_calls():
+    """Test that multiple async tools can run concurrently."""
+    all_started = asyncio.Event()
+    started = set()
+
+    async def wait_for_peers(x: int, y: str) -> str:
+        started.add(x)
+        if len(started) == 5:
+            all_started.set()
+        await all_started.wait()
+        return f"{y} {x}"
+
+    tool = Tool(wait_for_peers)
+    tasks = [tool.acall(x=i, y=f"hello{i}") for i in range(5)]
+    # No call can finish until all five have entered. The timeout only bounds a deadlock.
+    results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+
+    # Verify results, `asyncio.gather` returns results in the order of the tasks
+    assert results == [f"hello{i} {i}" for i in range(5)]
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_async_tool_call_in_sync_mode():
+    tool = Tool(async_dummy_function)
+    with AlinGo-Prompt.context(allow_tool_async_sync_conversion=False):
+        with pytest.raises(ValueError, match=r".*acall.*allow_tool_async_sync_conversion.*"):
+            result = tool(x=1, y="hello")
+
+    with AlinGo-Prompt.context(allow_tool_async_sync_conversion=True):
+        result = tool(x=1, y="hello")
+        assert result == "hello 1"
+
+
+@pytest.mark.asyncio
+async def test_async_tool_sync_call_within_running_loop():
+    tool = Tool(async_dummy_function)
+    with AlinGo-Prompt.context(allow_tool_async_sync_conversion=True):
+        with pytest.raises(ValueError, match=r".*await tool\.acall.*"):
+            tool(x=1, y="hello")
+
+
+TOOL_CALL_TEST_CASES = [
+    ([], {"tool_calls": []}),
+    (
+        [{"name": "search", "args": {"query": "hello"}}],
+        {
+            "tool_calls": [{"name": "search", "args": {"query": "hello"}}],
+        },
+    ),
+    (
+        [
+            {"name": "search", "args": {"query": "hello"}},
+            {"name": "translate", "args": {"text": "world", "lang": "fr"}},
+        ],
+        {
+            "tool_calls": [
+                {"name": "search", "args": {"query": "hello"}},
+                {"name": "translate", "args": {"text": "world", "lang": "fr"}},
+            ],
+        },
+    ),
+    (
+        [{"name": "get_time", "args": {}}],
+        {
+            "tool_calls": [{"name": "get_time", "args": {}}],
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize("tool_calls_data,expected", TOOL_CALL_TEST_CASES)
+def test_tool_calls_format_basic(tool_calls_data, expected):
+    """Test ToolCalls.format with various basic scenarios."""
+    tool_calls_list = [ToolCalls.ToolCall(**data) for data in tool_calls_data]
+    tool_calls = ToolCalls(tool_calls=tool_calls_list)
+    result = tool_calls.format()
+
+    assert result == expected
+
+
+def test_tool_calls_format_from_dict_list():
+    """Test format works with ToolCalls created from from_dict_list."""
+    tool_calls_dicts = [
+        {"name": "search", "args": {"query": "hello"}},
+        {"name": "translate", "args": {"text": "world", "lang": "fr"}},
+    ]
+
+    tool_calls = ToolCalls.from_dict_list(tool_calls_dicts)
+    result = tool_calls.format()
+
+    assert len(result["tool_calls"]) == 2
+    assert result["tool_calls"][0]["name"] == "search"
+    assert result["tool_calls"][1]["name"] == "translate"
+
+
+@pytest.mark.parametrize("adapter_type", [AlinGo-Prompt.ChatAdapter, AlinGo-Prompt.JSONAdapter, AlinGo-Prompt.XMLAdapter])
+def test_tool_calls_preserves_ids_from_dict_list_and_format_omits_ids(adapter_type):
+    tool_calls = ToolCalls.from_dict_list(
+        [
+            {"id": "call_1", "name": "search", "args": {"query": "hello"}},
+            {"name": "translate", "args": {"text": "world", "lang": "fr"}},
+        ]
+    )
+
+    assert tool_calls.tool_calls[0].id == "call_1"
+    assert tool_calls.tool_calls[1].id is None
+
+    formatted = tool_calls.format()["tool_calls"]
+    assert "id" not in formatted[0]
+    assert "id" not in formatted[1]
+
+    restored = ToolCalls.model_validate_json(tool_calls.model_dump_json())
+    assert [call.id for call in restored.tool_calls] == ["call_1", None]
+    signature = AlinGo-Prompt.Signature("question -> calls: AlinGo-Prompt.ToolCalls")
+    content = adapter_type().format_assistant_message_content(signature, {"calls": tool_calls})
+    assert "call_1" not in content
+    assert "hello" in content
+
+
+def test_tool_calls_json_schema_omits_internal_id_field():
+    schema = TypeAdapter(ToolCalls).json_schema()
+
+    assert "tool_call_results" not in schema["properties"]
+    assert "id" not in schema["$defs"]["ToolCall"]["properties"]
+    assert "continuation" not in schema["$defs"]["ToolCall"]["properties"]
+    assert schema["$defs"]["ToolCall"]["properties"]["args"]["additionalProperties"] is True
+    assert schema["$defs"]["ToolCall"]["required"] == ["name", "args"]
+
+
+def test_tool_calls_can_carry_results_without_formatting_them_for_lm():
+    tool_call = ToolCalls.ToolCall(id="call_1", name="search", args={"query": "hello"})
+    results = ToolCallResults.from_tool_calls_and_values([tool_call], [{"answer": "world"}])
+    tool_calls = ToolCalls(tool_calls=[tool_call], tool_call_results=results)
+
+    assert "tool_call_results" not in tool_calls.format()
+    assert tool_calls.model_dump(mode="json")["tool_call_results"] == {
+        "tool_call_results": [
+            {"call_id": "call_1", "name": "search", "value": {"answer": "world"}, "is_error": False}
+        ]
+    }
+
+
+@pytest.mark.parametrize("adapter_type", [AlinGo-Prompt.ChatAdapter, AlinGo-Prompt.JSONAdapter, AlinGo-Prompt.XMLAdapter])
+@pytest.mark.parametrize("saved_demo", [False, True])
+@pytest.mark.parametrize("annotation", [ToolCalls, ToolCalls | None, Optional[ToolCalls]])  # noqa: UP045 -- both union spellings
+def test_tool_call_examples_preserve_attached_results_and_nested_application_data(adapter_type, saved_demo, annotation):
+    inner = ToolCalls.from_dict_list([{"id": "inner-id", "name": "lookup", "args": {"query": "hello"}}])
+    outer = ToolCalls.from_dict_list([{"id": "outer-id", "name": "search", "args": {
+        "nested": inner, "tool_calls": [{"id": "business-id"}],
+    }}])
+    outer.tool_call_results = ToolCallResults.from_tool_calls_and_values(outer.tool_calls, [inner])
+    outer.tool_calls[0].continuation = [{"provider": "gemini", "kind": "thought_signature", "data": {"value": "opaque-root"}}]
+
+    saved = outer.model_dump(mode="json")
+    assert saved["tool_calls"][0]["args"]["nested"]["tool_calls"][0]["id"] == "inner-id"
+    assert saved["tool_call_results"]["tool_call_results"][0]["value"]["tool_calls"][0]["id"] == "inner-id"
+    signature = AlinGo-Prompt.Signature({"question": (str, AlinGo-Prompt.InputField()), "calls": (annotation, AlinGo-Prompt.OutputField())})
+    predictor = AlinGo-Prompt.Predict(signature)
+    predictor.demos = [AlinGo-Prompt.Example(question="Look up the order.", calls=outer)]
+    if saved_demo:
+        state = json.loads(json.dumps(predictor.dump_state()))
+        predictor = AlinGo-Prompt.Predict(signature).load_state(state)
+    content = adapter_type().format_demos(predictor.signature, predictor.demos)[-1].text
+    rendered = adapter_type().parse(signature, content)["calls"]
+    assert rendered.tool_calls[0].id is None
+    assert rendered.tool_calls[0].continuation == []
+    assert "opaque-root" not in content
+    assert rendered.tool_calls[0].args == saved["tool_calls"][0]["args"]
+    assert rendered.tool_call_results == saved["tool_call_results"]
+    assert outer.model_dump(mode="json") == saved
+    # An application dictionary with identical keys is data, not a typed tool-call example.
+    data_signature = AlinGo-Prompt.Signature("question -> record: dict")
+    content = adapter_type().format_assistant_message_content(data_signature, {"record": saved})
+    assert adapter_type().parse(data_signature, content)["record"] == saved
+
+
+def test_tool_call_results_from_tool_calls_and_values():
+    tool_calls = [
+        ToolCalls.ToolCall(id="call_1", name="search", args={"query": "hello"}),
+        ToolCalls.ToolCall(id="call_2", name="fetch", args={"url": "https://example.com"}),
+    ]
+
+    results = ToolCallResults.from_tool_calls_and_values(
+        tool_calls,
+        [{"items": [1, 2]}, "failed"],
+        is_errors=[False, True],
+    )
+
+    assert results.tool_call_results[0].call_id == "call_1"
+    assert results.tool_call_results[0].name == "search"
+    assert results.tool_call_results[0].value == {"items": [1, 2]}
+    assert results.tool_call_results[0].is_error is False
+    assert results.tool_call_results[1].call_id == "call_2"
+    assert results.tool_call_results[1].name == "fetch"
+    assert results.tool_call_results[1].value == "failed"
+    assert results.tool_call_results[1].is_error is True
+
+
+def test_tool_call_results_history_serialization_round_trip():
+    tool_call = ToolCalls.ToolCall(id="call_1", name="search", args={"query": "hello"})
+    results = ToolCallResults.from_tool_calls_and_values(
+        [tool_call],
+        [{"answer": "world"}],
+    )
+    tool_calls = ToolCalls(tool_calls=[tool_call], tool_call_results=results)
+
+    history = AlinGo-Prompt.History(messages=[{"tool_calls": tool_calls}])
+    dumped = history.model_dump(mode="json")
+    restored = AlinGo-Prompt.History.model_validate(dumped)
+
+    assert dumped == {
+        "messages": [
+            {
+                "tool_calls": {
+                    "tool_calls": [
+                        {"id": "call_1", "name": "search", "args": {"query": "hello"}}
+                    ],
+                    "tool_call_results": {
+                        "tool_call_results": [
+                            {"call_id": "call_1", "name": "search", "value": {"answer": "world"}, "is_error": False}
+                        ]
+                    },
+                }
+            }
+        ]
+    }
+    assert restored.messages == dumped["messages"]
+
+
+def test_tool_call_results_can_round_trip_as_native_tool_result_message():
+    tool_call = ToolCalls.ToolCall(id="call_1", name="search", args={"query": "cats"})
+    results = ToolCallResults.from_tool_calls_and_values([tool_call], ['{"items": ["cat"]}'])
+    result = results.tool_call_results[0]
+
+    message = Message.tool(tool_result(result.call_id, result.value, name=result.name))
+
+    assert len(message.parts) == 1
+    assert isinstance(message.parts[0], ToolResultPart)
+    assert message.parts[0].id == "call_1"
+    assert message.parts[0].name == "search"
+    assert message.parts[0].content[0].text == '{"items": ["cat"]}'
+
+    request = Request(model="test-model", messages=[message])
+    assert request_kwargs(request, "chat")["messages"] == [
+        {"role": "tool", "content": '{"items": ["cat"]}', "tool_call_id": "call_1"}
+    ]
+
+
+def test_toolcalls_vague_match():
+    """
+    Test that ToolCalls can parse the data with slightly off format:
+
+    - a single dict with "name" and "args"
+    - a list of dicts with "name" and "args"
+    - invalid input (should raise ValueError)
+    """
+    # Single dict with "name" and "args" should parse as one ToolCall
+    data_single = {"name": "search", "args": {"query": "hello"}}
+    tc = ToolCalls.model_validate(data_single)
+    assert isinstance(tc, ToolCalls)
+    assert len(tc.tool_calls) == 1
+    assert tc.tool_calls[0].name == "search"
+    assert tc.tool_calls[0].args == {"query": "hello"}
+
+    # List of dicts with "name" and "args" should parse as multiple ToolCalls
+    data_list = [
+        {"name": "search", "args": {"query": "hello"}},
+        {"name": "translate", "args": {"text": "world", "lang": "fr"}},
+    ]
+    tc = ToolCalls.model_validate(data_list)
+    assert isinstance(tc, ToolCalls)
+    assert len(tc.tool_calls) == 2
+    assert tc.tool_calls[0].name == "search"
+    assert tc.tool_calls[1].name == "translate"
+
+    # Dict with "tool_calls" key containing a list of dicts
+    data_tool_calls = {
+        "tool_calls": [
+            {"name": "search", "args": {"query": "hello"}},
+            {"name": "get_time", "args": {}},
+        ]
+    }
+    tc = ToolCalls.model_validate(data_tool_calls)
+    assert isinstance(tc, ToolCalls)
+    assert len(tc.tool_calls) == 2
+    assert tc.tool_calls[0].name == "search"
+    assert tc.tool_calls[1].name == "get_time"
+
+    # Top-level "arguments" should be accepted as an alias for "args".
+    tc = ToolCalls.model_validate({"name": "search", "arguments": {"query": "hello"}})
+    assert len(tc.tool_calls) == 1
+    assert tc.tool_calls[0].name == "search"
+    assert tc.tool_calls[0].args == {"query": "hello"}
+
+    # List entries with "arguments" should normalize to ToolCall.args.
+    tc = ToolCalls.model_validate(
+        [
+            {"name": "search", "arguments": {"query": "hello"}},
+            {"name": "get_time", "arguments": {}},
+        ]
+    )
+    assert len(tc.tool_calls) == 2
+    assert tc.tool_calls[0].args == {"query": "hello"}
+    assert tc.tool_calls[1].args == {}
+
+    # "tool_calls" wrappers may also use "arguments".
+    tc = ToolCalls.model_validate({"tool_calls": [{"name": "search", "arguments": {"query": "hello"}}]})
+    assert len(tc.tool_calls) == 1
+    assert tc.tool_calls[0].args == {"query": "hello"}
+
+    # Provider-style nested function.arguments should accept dict and JSON-string values.
+    tc = ToolCalls.model_validate(
+        {"type": "function", "function": {"name": "search", "arguments": {"query": "hello"}}}
+    )
+    assert len(tc.tool_calls) == 1
+    assert tc.tool_calls[0].args == {"query": "hello"}
+
+    tc = ToolCalls.model_validate(
+        {"type": "function", "function": {"name": "search", "arguments": '{"query":"hello"}'}}
+    )
+    assert len(tc.tool_calls) == 1
+    assert tc.tool_calls[0].args == {"query": "hello"}
+
+    # Invalid input should raise ValueError
+    with pytest.raises(ValueError):
+        ToolCalls.model_validate({"foo": "bar"})
+    with pytest.raises(ValueError):
+        ToolCalls.model_validate([{"foo": "bar"}])
+    with pytest.raises(ValueError, match="function value"):
+        ToolCalls.from_dict_list([{"function": "bad"}])
+
+
+def test_tool_convert_input_schema_to_tool_args_no_input_params():
+    args, arg_types, arg_desc = convert_input_schema_to_tool_args(schema={"properties": {}})
+    assert args == {}
+    assert arg_types == {}
+    assert arg_desc == {}
+
+
+def test_tool_convert_input_schema_to_tool_args_lang_chain():
+    # Example from langchain docs:
+    # https://web.archive.org/web/20250723101359/https://api.python.langchain.com/en/latest/tools/langchain_core.tools.tool.html
+    args, arg_types, arg_desc = convert_input_schema_to_tool_args(
+        schema={
+            "title": "fooSchema",
+            "description": "The foo.",
+            "type": "object",
+            "properties": {
+                "bar": {
+                    "title": "Bar",
+                    "description": "The bar.",
+                    "type": "string",
+                },
+                "baz": {
+                    "title": "Baz",
+                    "type": "integer",
+                },
+            },
+            "required": [
+                "baz",
+            ],
+        }
+    )
+    assert args == {
+        "bar": {"title": "Bar", "description": "The bar.", "type": "string"},
+        "baz": {"title": "Baz", "type": "integer"},
+    }
+    assert arg_types == {
+        "bar": str,
+        "baz": int,
+    }
+    assert arg_desc == {
+        "bar": "The bar.",
+        "baz": "No description provided. (Required)",
+    }
+
+
+
+
+def test_tool_call_execute():
+    def get_weather(city: str) -> str:
+        return f"The weather in {city} is sunny"
+
+    def add_numbers(a: int, b: int) -> int:
+        return a + b
+
+    tools = [
+        AlinGo-Prompt.Tool(get_weather),
+        AlinGo-Prompt.Tool(add_numbers)
+    ]
+
+    tool_call = AlinGo-Prompt.ToolCalls.ToolCall(name="get_weather", args={"city": "Berlin"})
+    result = tool_call.execute(functions=tools)
+    assert result == "The weather in Berlin is sunny"
+
+    # Test individual tool call with function dict
+    tool_call2 = AlinGo-Prompt.ToolCalls.ToolCall(name="add_numbers", args={"a": 7, "b": 13})
+    result2 = tool_call2.execute(functions={"add_numbers": add_numbers})
+    assert result2 == 20
+
+    # Test individual tool call with no arguments
+    def get_pi():
+        return 3.14159
+
+    tool_call3 = AlinGo-Prompt.ToolCalls.ToolCall(name="get_pi", args={})
+    result3 = tool_call3.execute(functions={"get_pi": get_pi})
+    assert result3 == 3.14159
+
+    # Test error case
+    tool_call4 = AlinGo-Prompt.ToolCalls.ToolCall(name="nonexistent", args={})
+    with pytest.raises(ValueError) as exc_info:
+        tool_call4.execute(functions=tools)
+    assert "not found" in str(exc_info.value)
+
+
+def test_tool_call_execute_with_local_functions():
+    def main():
+        def local_add(a: int, b: int) -> int:
+            return a + b
+
+        def local_multiply(x: int, y: int) -> int:
+            return x * y
+
+        # Test individual execution with local function
+        tool_call1 = AlinGo-Prompt.ToolCalls.ToolCall(name="local_add", args={"a": 10, "b": 15})
+        result1 = tool_call1.execute()  # Should find local function automatically
+        assert result1 == 25
+
+        tool_call2 = AlinGo-Prompt.ToolCalls.ToolCall(name="local_multiply", args={"x": 4, "y": 7})
+        result2 = tool_call2.execute()  # Should find local function automatically
+        assert result2 == 28
+
+        # Test locals take precedence over globals
+        try:
+            globals()["local_add"] = lambda a, b: a + b + 1000
+            precedence_call = AlinGo-Prompt.ToolCalls.ToolCall(name="local_add", args={"a": 1, "b": 2})
+            result = precedence_call.execute()
+            assert result == 3  # Should use local function (1+2=3), not global (1+2+1000=1003)
+        finally:
+            globals().pop("local_add", None)
+
+    main()
+
+
+def test_tool_calls_none_and_empty_dict_mean_no_calls():
+    """`"tool_calls": null` / `{}` are how JSON-mode models say "no tool calls
+    this turn" -- they must parse like `[]`, not raise AdapterParseError (#10612)."""
+    for empty in (None, {}):
+        calls = AlinGo-Prompt.ToolCalls.model_validate(empty)
+        assert calls.tool_calls == []
+    # And through the wrapping form: {"tool_calls": None}
+    calls = AlinGo-Prompt.ToolCalls.model_validate({"tool_calls": None})
+    assert calls.tool_calls == []
+
+
+def test_tool_calls_none_reaches_empty_tool_calls_semantics():
+    """End-to-end: ReAct with a JSON-mode model writing `"tool_calls": null`
+    must take the usual empty_tool_calls path (like `[]`), not a parse error."""
+    adapter = AlinGo-Prompt.JSONAdapter()
+    lm = AlinGo-Prompt.utils.DummyLM([{"next_thought": "Nothing to call.", "tool_calls": None}] * 2, adapter=adapter)
+    with AlinGo-Prompt.context(lm=lm, adapter=adapter):
+        try:
+            AlinGo-Prompt.ReAct("question -> answer", tools=[])(question="hi")
+            raised = None
+        except Exception as e:
+            raised = e
+    assert raised is not None
+    assert "empty_tool_calls" in str(raised), f"expected empty_tool_calls semantics, got: {raised}"

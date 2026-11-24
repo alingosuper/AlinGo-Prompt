@@ -1,0 +1,231 @@
+import warnings
+from typing import Any
+
+from AlinGo-Prompt.adapters.base import Adapter, Prompt, response_text, user_message
+from AlinGo-Prompt.adapters.chat_adapter import ChatAdapter
+from AlinGo-Prompt.adapters.types import ToolCalls
+from AlinGo-Prompt.adapters.utils import get_field_description_string
+from AlinGo-Prompt.clients.base_lm import BaseLM
+from AlinGo-Prompt.clients.requests import build_request
+from AlinGo-Prompt.signatures.field import InputField
+from AlinGo-Prompt.signatures.signature import Signature, make_signature
+from AlinGo-Prompt.utils.exceptions import AdapterParseError
+
+"""
+NOTE/TODO/FIXME:
+
+The main issue below is that the second step's signature is entirely created on the fly and is invoked with a chat
+adapter explicitly constructed with no demonstrations. This means that it cannot "learn" or get optimized.
+"""
+
+
+class TwoStepAdapter(Adapter):
+    """
+    .. deprecated:: 3.5
+        Will be removed in DSPy 3.6. Use ``AlinGo-Prompt.JSONAdapter()`` for models supporting
+        structured outputs, or ``AlinGo-Prompt.XMLAdapter()`` otherwise. These adapters do not
+        use a separate extraction LM.
+
+    A two-stage adapter that:
+        1. Uses a simpler, more natural prompt for the main LM
+        2. Uses a smaller LM with chat adapter to extract structured data from the response of main LM
+    This adapter uses a common __call__ logic defined in base Adapter class.
+    This class is particularly useful when interacting with reasoning models as the main LM since reasoning models
+    are known to struggle with structured outputs.
+
+    Examples:
+    ```
+    import AlinGo-Prompt
+    lm = AlinGo-Prompt.LM(model="openai/o3-mini", max_tokens=16000, temperature = 1.0)
+    adapter = AlinGo-Prompt.TwoStepAdapter(AlinGo-Prompt.LM("openai/gpt-4o-mini"))
+    AlinGo-Prompt.configure(lm=lm, adapter=adapter)
+    program = AlinGo-Prompt.ChainOfThought("question->answer")
+    result = program("What is the capital of France?")
+    print(result)
+    ```
+    """
+
+    def __init__(self, extraction_model: BaseLM, **kwargs):
+        warnings.warn(
+            "AlinGo-Prompt.TwoStepAdapter is deprecated in DSPy 3.5 and will be removed in DSPy 3.6. "
+            "Use AlinGo-Prompt.JSONAdapter() for models supporting structured outputs, or AlinGo-Prompt.XMLAdapter() otherwise.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(**kwargs)
+        if not isinstance(extraction_model, BaseLM):
+            raise ValueError("extraction_model must be an instance of AlinGo-Prompt.BaseLM")
+        self.extraction_model = extraction_model
+
+    def format(self, signature: type[Signature], demos: list[dict[str, Any]], inputs: dict[str, Any]) -> Prompt:
+        """
+        Format a prompt for the first stage with the main LM.
+        This no specific structure is required for the main LM, we customize the format method
+        instead of format_field_description or format_field_structure.
+
+        Args:
+            signature: The signature of the original task
+            demos: A list of demo examples
+            inputs: The current input
+
+        Returns:
+            The prompt for the main LM.
+        """
+        messages = list(self.format_demos(signature, demos))
+        messages.append(user_message(self.format_user_message_content(signature, inputs)))
+        return Prompt(system=self.format_task_description(signature), messages=tuple(messages))
+
+    def parse(self, signature: Signature, completion: str) -> dict[str, Any]:
+        """
+        Use a smaller LM (extraction_model) with chat adapter to extract structured data
+        from the raw completion text of the main LM.
+
+        Args:
+            signature: The signature of the original task
+            completion: The completion from the main LM
+
+        Returns:
+            A dictionary containing the extracted structured data.
+        """
+        # The signature is supposed to be "text -> {original output fields}"
+        extractor_signature = self._create_extractor_signature(signature)
+
+        try:
+            # Call the smaller LM to extract structured data from the raw completion text with ChatAdapter
+            parsed_result = ChatAdapter()(
+                lm=self.extraction_model,
+                lm_kwargs={},
+                signature=extractor_signature,
+                demos=[],
+                inputs={"text": completion},
+            )
+            return parsed_result[0]
+
+        except AdapterParseError as e:
+            raise AdapterParseError(
+                adapter_name="TwoStepAdapter",
+                signature=signature,
+                lm_response=completion,
+                message=f"Failed to parse response from the original completion: {e}",
+            ) from e
+
+    async def acall(
+        self,
+        lm: BaseLM,
+        lm_kwargs: dict[str, Any],
+        signature: type[Signature],
+        demos: list[dict[str, Any]],
+        inputs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        from AlinGo-Prompt.adapters.base import _candidate_calls
+
+        request = build_request(lm, self.format(signature, demos, inputs), lm_kwargs)
+        responses = [await lm.acall(candidate, **options) for candidate, options in _candidate_calls(lm, lm_kwargs, request)]
+        # The signature is supposed to be "text -> {original output fields}"
+        extractor_signature = self._create_extractor_signature(signature)
+
+        values = []
+
+        tool_call_output_field_name = self._get_tool_call_output_field_name(signature)
+        for response in responses:
+            text = response_text(response) or ""
+            try:
+                # Call the smaller LM to extract structured data from the raw completion text with ChatAdapter
+                value = await ChatAdapter().acall(
+                    lm=self.extraction_model,
+                    lm_kwargs={},
+                    signature=extractor_signature,
+                    demos=[],
+                    inputs={"text": text},
+                )
+                value = value[0]
+
+            except AdapterParseError as e:
+                raise AdapterParseError(
+                    adapter_name="TwoStepAdapter",
+                    signature=signature,
+                    lm_response=text,
+                    message=f"Failed to parse response from the original completion: {e}",
+                ) from e
+
+            if response.tool_calls and tool_call_output_field_name:
+                value[tool_call_output_field_name] = ToolCalls.from_dict_list(
+                    [{"id": call.id, "name": call.name, "args": call.input} for call in response.tool_calls]
+                )
+
+            if response.logprobs is not None:
+                value["logprobs"] = response.logprobs
+
+            values.append(value)
+        return values
+
+    def format_task_description(self, signature: Signature) -> str:
+        """Create a description of the task based on the signature"""
+        parts = []
+
+        parts.append("You are a helpful assistant that can solve tasks based on user input.")
+        parts.append("As input, you will be provided with:\n" + get_field_description_string(signature.input_fields))
+        parts.append("Your outputs must contain:\n" + get_field_description_string(signature.output_fields))
+        parts.append("You should lay out your outputs in detail so that your answer can be understood by another agent")
+
+        if signature.instructions:
+            parts.append(f"Specific instructions: {signature.instructions}")
+
+        return "\n".join(parts)
+
+    def format_user_message_content(
+        self,
+        signature: type[Signature],
+        inputs: dict[str, Any],
+        prefix: str = "",
+        suffix: str = "",
+        main_request: bool = False,
+    ) -> str:
+        # `main_request` is accepted for compatibility with the base Adapter contract; the first-stage prompt has no
+        # output-format reminder to add.
+        parts = [prefix]
+
+        for name in signature.input_fields.keys():
+            if name in inputs:
+                parts.append(f"{name}: {inputs.get(name, '')}")
+
+        parts.append(suffix)
+        return "\n\n".join(parts).strip()
+
+    def format_assistant_message_content(
+        self,
+        signature: type[Signature],
+        outputs: dict[str, Any],
+        missing_field_message: str | None = None,
+    ) -> str:
+        parts = []
+
+        for name in signature.output_fields.keys():
+            if name in outputs:
+                parts.append(f"{name}: {outputs.get(name, missing_field_message)}")
+
+        return "\n\n".join(parts).strip()
+
+    def _create_extractor_signature(
+        self,
+        original_signature: type[Signature],
+    ) -> type[Signature]:
+        """Create a new signature containing a new 'text' input field and all output fields.
+
+        Args:
+            original_signature: The original signature to extract output fields from
+
+        Returns:
+            A new Signature type with a text input field and all output fields
+        """
+        # Create new fields dict with 'text' input field and all output fields
+        new_fields = {
+            "text": (str, InputField()),
+            **{name: (field.annotation, field) for name, field in original_signature.output_fields.items()},
+        }
+
+        outputs_str = ", ".join([f"`{field}`" for field in original_signature.output_fields])
+        instructions = f"The input is a text that should contain all the necessary information to produce the fields {outputs_str}. \
+            Your job is to extract the fields from the text verbatim. Extract precisely the appropriate value (content) for each field."
+
+        return make_signature(new_fields, instructions)

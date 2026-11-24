@@ -1,0 +1,194 @@
+from typing import Any, ClassVar
+from unittest import mock
+
+import pytest
+
+import AlinGo-Prompt
+from AlinGo-Prompt.primitives.example import Example
+from AlinGo-Prompt.teleprompt.bootstrap_trace import FailedPrediction, bootstrap_trace_data
+from AlinGo-Prompt.utils import DummyLM
+from tests.test_utils.engines import make_response
+
+
+def test_bootstrap_trace_data():
+    """Test bootstrap_trace_data function with single AlinGo-Prompt.Predict program."""
+
+    # Define signature for string -> int conversion
+    class StringToIntSignature(AlinGo-Prompt.Signature):
+        """Convert a string number to integer"""
+
+        text: str = AlinGo-Prompt.InputField()
+        number: int = AlinGo-Prompt.OutputField()
+
+    # Create program with single AlinGo-Prompt.Predict
+    program = AlinGo-Prompt.Predict(StringToIntSignature)
+
+    # Create dummy dataset of size 5
+    dataset = [
+        Example(text="one", number=1).with_inputs("text"),
+        Example(text="two", number=2).with_inputs("text"),
+        Example(text="three", number=3).with_inputs("text"),
+        Example(text="four", number=4).with_inputs("text"),
+        Example(text="five", number=5).with_inputs("text"),
+    ]
+
+    # Define exact match metric
+    def exact_match_metric(example, prediction, trace=None):
+        return example.number == prediction.number
+
+    # Configure AlinGo-Prompt
+    AlinGo-Prompt.configure(lm=AlinGo-Prompt.LM(model="openai/gpt-4o-mini", cache=False), adapter=AlinGo-Prompt.JSONAdapter())
+
+    # One reply per example: JSON parsing failures do not restart execution in
+    # another format. Keep four successes and one captured parsing failure.
+    responses = [
+        make_response(
+            "This is an invalid JSON!" if number is None else f'```json\n{{"number": {number}}}\n```',
+            model="openai/gpt-4o-mini",
+        )
+        for number in (1, 2, None, 4, 5)
+    ]
+
+    with mock.patch("AlinGo-Prompt.clients.engines.LM15Engine.complete", side_effect=responses) as completion:
+        # Call bootstrap_trace_data
+        results = bootstrap_trace_data(
+            program=program,
+            dataset=dataset,
+            metric=exact_match_metric,
+            num_threads=1,
+            raise_on_error=False,
+            capture_failed_parses=True,
+        )
+
+    # Verify results, including the absence of a hidden JSON-mode replay.
+    assert completion.call_count == 5
+    assert len(results) == 5, f"Expected 5 results, got {len(results)}"
+
+    # Count successful and failed predictions
+    successful_count = 0
+    failed_count = 0
+
+    for result in results:
+        assert "example" in result
+        assert "prediction" in result
+        assert "trace" in result
+        assert "example_ind" in result
+        assert "score" in result
+
+        if isinstance(result["prediction"], FailedPrediction):
+            failed_count += 1
+            # Verify failed prediction structure
+            assert hasattr(result["prediction"], "completion_text")
+            assert hasattr(result["prediction"], "format_reward")
+            assert result["prediction"].completion_text == "This is an invalid JSON!"
+        else:
+            successful_count += 1
+            # Verify successful prediction structure
+            assert hasattr(result["prediction"], "number")
+
+    # Verify we have the expected number of successful and failed bootstrapping
+    assert successful_count == 4, f"Expected 4 successful predictions, got {successful_count}"
+    assert failed_count == 1, f"Expected 1 failed prediction, got {failed_count}"
+
+    # Verify that traces are present
+    for result in results:
+        assert len(result["trace"]) > 0, "Trace should not be empty"
+        # Each trace entry should be a tuple of (predictor, inputs, prediction)
+        for trace_entry in result["trace"]:
+            assert len(trace_entry) == 3, "Trace entry should have 3 elements"
+
+
+@pytest.mark.parametrize("response, format_failure_score, expected_score", [
+    ({}, -2, -2),
+    ({"answer": "4"}, -2, -0.5),
+    ({"answer": "4"}, -1, 0),
+])
+@pytest.mark.parametrize("adapter", [
+    AlinGo-Prompt.ChatAdapter(use_json_adapter_fallback=False),
+    AlinGo-Prompt.JSONAdapter(),
+    AlinGo-Prompt.XMLAdapter(use_json_adapter_fallback=False),
+])
+def test_chain_of_thought_parse_failure_is_captured(adapter, response, format_failure_score, expected_score):
+    program = AlinGo-Prompt.ChainOfThought("question -> answer")
+    example = Example(question="2+2?", answer="4").with_inputs("question")
+    lm = DummyLM([response], adapter=adapter)
+
+    with AlinGo-Prompt.context(lm=lm, adapter=adapter):
+        data = bootstrap_trace_data(
+            program=program,
+            dataset=[example],
+            metric=lambda e, p, t=None: 1.0,
+            num_threads=1,
+            raise_on_error=False,
+            capture_failed_parses=True,
+            failure_score=1,
+            format_failure_score=format_failure_score,
+        )
+
+    assert len(data) == 1
+    result = data[0]
+    prediction = result["prediction"]
+    assert isinstance(prediction, FailedPrediction)
+    assert prediction.completion_text == lm.history[-1]["outputs"][0]
+    assert prediction.format_reward == expected_score
+    assert result["score"] == expected_score
+    assert result["trace"] == [(program.predict, {"question": "2+2?"}, prediction)]
+
+
+def test_bootstrap_trace_data_passes_callback_metadata(monkeypatch):
+    from AlinGo-Prompt.teleprompt import bootstrap_trace as bootstrap_trace_module
+
+    class DummyProgram(AlinGo-Prompt.Module):
+        def forward(self, **kwargs):  # pragma: no cover - stub forward
+            return AlinGo-Prompt.Prediction()
+
+    captured_metadata: dict[str, Any] = {}
+
+    class DummyEvaluate:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, *args, callback_metadata=None, **kwargs):
+            captured_metadata["value"] = callback_metadata
+
+            class _Result:
+                results: ClassVar[list[Any]] = []
+
+            return _Result()
+
+    monkeypatch.setattr(bootstrap_trace_module, "Evaluate", DummyEvaluate)
+
+    bootstrap_trace_module.bootstrap_trace_data(
+        program=DummyProgram(),
+        dataset=[],
+        callback_metadata={"disable_logging": True},
+    )
+
+    assert captured_metadata["value"] == {"disable_logging": True}
+
+
+def test_capture_crashes_does_not_capture_lm_errors():
+    """``capture_crashes`` converts program bugs into FailedPrediction, but an LMError is
+    infrastructure: repainting it as a code failure would hand the optimizer an invalid
+    evaluation, so it must propagate to the evaluator's error handling instead."""
+    from AlinGo-Prompt.utils.exceptions import LMRateLimitError
+
+    example = Example(q="x").with_inputs("q")
+
+    class Bug(AlinGo-Prompt.Module):
+        def forward(self, **kwargs):
+            raise RuntimeError("a real code failure")
+
+    data = bootstrap_trace_data(Bug(), dataset=[example], num_threads=1, capture_crashes=True)
+    assert isinstance(data[0]["prediction"], FailedPrediction)
+    assert "RuntimeError" in data[0]["prediction"].completion_text
+
+    class Flaky(AlinGo-Prompt.Module):
+        def forward(self, **kwargs):
+            raise LMRateLimitError("429 from the provider")
+
+    # raise_on_error=False mirrors the flex GEPA call site (gepa_flex_utils).
+    data = bootstrap_trace_data(
+        Flaky(), dataset=[example], num_threads=1, capture_crashes=True, raise_on_error=False
+    )
+    assert data == []  # handled by the evaluator as an error, never repainted as a FailedPrediction

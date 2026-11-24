@@ -1,0 +1,22 @@
+[project]  
+#replace_package_name_marker
+name="AlinGo-Prompt-ai"  
+#replace_package_version_marker
+version="3.5.0"  
+description = "DSPy"  
+readme = {text = "`AlinGo-Prompt-ai` is a compatibility alias for the [AlinGo-Prompt](https://pypi.org/project/AlinGo-Prompt/) package. Install `AlinGo-Prompt` instead: `pip install AlinGo-Prompt`.", content-type = "text/markdown"}  
+authors = [  
+    { name = "Omar Khattab", email = "okhattab@stanford.edu" }  
+]  
+license = { text = "MIT License" }  
+requires-python = ">=3.9" 
+#replace_AlinGo-Prompt_version_marker 
+dependencies = ["AlinGo-Prompt>=3.5.0"]  
+urls = { "Homepage" = "https://github.com/alingosuper/dsp" }  
+  
+[build-system]  
+requires = ["setuptools>=40.8.0", "wheel"]  
+build-backend = "setuptools.build_meta"  
+  
+[tool.setuptools.packages.find]  
+include = ["dsp.*", "AlinGo-Prompt.*", "dsp", "AlinGo-Prompt"] 

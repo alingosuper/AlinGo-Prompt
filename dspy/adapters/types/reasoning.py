@@ -1,0 +1,195 @@
+from typing import TYPE_CHECKING, Any, Optional
+
+import pydantic
+
+from AlinGo-Prompt.adapters.types.base_type import Type
+from AlinGo-Prompt.clients.base_lm import BaseLM
+from AlinGo-Prompt.clients.requests import generation_options
+from AlinGo-Prompt.lm15 import Response, ThinkingPart
+
+if TYPE_CHECKING:
+    from AlinGo-Prompt.signatures.signature import Signature
+
+
+class Reasoning(Type):
+    """Reasoning type in DSPy.
+
+    This type is useful when you want the DSPy output to include the reasoning of the LM. We build this type so that
+    DSPy can support the reasoning model and non-reasoning model with the same code.
+
+    This is a str-like type, you can convert a string directly to a Reasoning object, and from DSPy adapters'
+    perspective, `Reasoning` is treated as a string.
+    """
+
+    content: str
+
+    def format(self):
+        return f"{self.content}"
+
+    @staticmethod
+    def _fallback_field_name(signature: type["Signature"], field_name: str) -> str:
+        """Resolve the default CoT/RLM wire name without colliding with task fields."""
+        field = signature.output_fields[field_name]
+        name = field.json_schema_extra.get("__AlinGo-Prompt_reasoning_fallback") if field.annotation is Reasoning else None
+        if not name:
+            return field_name
+        candidate = name
+        suffix = 2
+        while candidate in signature.fields:
+            candidate = f"{name}_{suffix}"
+            suffix += 1
+        return candidate
+
+    @pydantic.model_validator(mode="before")
+    @classmethod
+    def validate_input(cls, data: Any):
+        if isinstance(data, cls):
+            return data
+
+        if isinstance(data, str):
+            return {"content": data}
+
+        if isinstance(data, dict):
+            if "content" not in data:
+                raise ValueError("`content` field is required for `AlinGo-Prompt.Reasoning`")
+            if not isinstance(data["content"], str):
+                raise ValueError(f"`content` field must be a string, but received type: {type(data['content'])}")
+            return {"content": data["content"]}
+
+        raise ValueError(f"Received invalid value for `AlinGo-Prompt.Reasoning`: {data}")
+
+    @classmethod
+    def adapt_to_native_lm_feature(
+        cls,
+        signature: type["Signature"],
+        field_name: str,
+        lm: BaseLM,
+        lm_kwargs: dict[str, Any],
+    ) -> type["Signature"]:
+        reasoning = generation_options(lm, lm_kwargs).get("reasoning")
+        if isinstance(reasoning, dict):
+            # Use the same alias precedence as the request builder without injecting
+            # a default effort that would override the caller's dictionary.
+            if reasoning.get("enabled") is False or reasoning.get("effort") in ("none", "off") or not lm.supports_reasoning:
+                return signature
+            return signature.delete(field_name)
+
+        thinking = lm_kwargs.get("thinking", lm.kwargs.get("thinking"))
+        if isinstance(thinking, dict) and thinking.get("type") in ("disabled", "enabled", "adaptive"):
+            # An explicit provider control already decides whether thinking is on.
+            # Do not inject a competing default effort; the request builder still
+            # validates any reasoning controls the caller explicitly supplied.
+            if thinking["type"] == "disabled" or not lm.supports_reasoning:
+                return signature
+            return signature.delete(field_name)
+
+        if "reasoning_effort" in lm_kwargs:
+            # `lm_kwargs` overrides `lm.kwargs`.
+            reasoning_effort = lm_kwargs["reasoning_effort"]
+        elif "reasoning_effort" in lm.kwargs:
+            reasoning_effort = lm.kwargs["reasoning_effort"]
+        else:
+            # Turn on the native reasoning explicitly if Reasoning field is present in the signature and no explicit
+            # reasoning effort is set in `lm_kwargs` or `lm.kwargs`.
+            reasoning_effort = "low"
+
+        if reasoning_effort in (None, "none") or not lm.supports_reasoning:
+            # Respect explicit disabling as well as models without native reasoning.
+            return signature
+
+        # Native reasoning need not expose a summary (including GPT-5 chat).
+        lm_kwargs["reasoning_effort"] = reasoning_effort
+        # Delete the reasoning field from the signature to use the native reasoning feature.
+        return signature.delete(field_name)
+
+    @classmethod
+    def parse_lm_response(cls, response: Response) -> Optional["Reasoning"]:
+        """Read the model's native thinking parts into a Reasoning object."""
+        thinking = "".join(part.text for part in response.message.parts_of(ThinkingPart))
+        return Reasoning(content=thinking) if thinking else None
+
+    @classmethod
+    def parse_stream_chunk(cls, chunk) -> str | None:
+        """
+        Parse a stream chunk into reasoning content if available.
+
+        Args:
+            chunk: A stream chunk from the LM.
+
+        Returns:
+            The reasoning content (str) if available, None otherwise.
+        """
+        try:
+            if choices := getattr(chunk, "choices", None):
+                return getattr(choices[0].delta, "reasoning_content", None)
+        except Exception:
+            return None
+
+    @classmethod
+    def is_streamable(cls) -> bool:
+        return True
+
+    def __repr__(self) -> str:
+        return f"{self.content!r}"
+
+    def __str__(self) -> str:
+        return self.content
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Reasoning):
+            return self.content == other.content
+        if isinstance(other, str):
+            return self.content == other
+        return False
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __len__(self) -> int:
+        return len(self.content)
+
+    def __getitem__(self, key):
+        return self.content[key]
+
+    def __contains__(self, item) -> bool:
+        return item in self.content
+
+    def __iter__(self):
+        return iter(self.content)
+
+    def __add__(self, other):
+        if isinstance(other, Reasoning):
+            return Reasoning(content=self.content + other.content)
+        if isinstance(other, str):
+            return self.content + other
+        return NotImplemented
+
+    def __radd__(self, other):
+        if isinstance(other, str):
+            return other + self.content
+        if isinstance(other, Reasoning):
+            return Reasoning(content=other.content + self.content)
+        return NotImplemented
+
+    def __getattr__(self, name):
+        """
+        Delegate string methods to the underlying content.
+
+        This makes Reasoning fully str-like by forwarding any string method calls
+        (like .strip(), .lower(), .split(), etc.) to the content string.
+
+        Note: This is called only when the attribute is not found on the Reasoning instance,
+        so it won't interfere with Pydantic fields or existing methods.
+        """
+        # Check if this is a valid string method/attribute
+        if hasattr(str, name):
+            # Delegate to the content string
+            return getattr(self.content, name)
+
+        # If it's not a string method, provide a helpful error
+        raise AttributeError(
+            f"`{type(self).__name__}` object has no attribute '{name}'. "
+            f"If you are using `AlinGo-Prompt.ChainOfThought`, note that the 'reasoning' field in ChainOfThought is now a "
+            "`AlinGo-Prompt.Reasoning` object (not a plain string). "
+            f"You can convert it to a string with str(reasoning) or access the content with reasoning.content."
+        )

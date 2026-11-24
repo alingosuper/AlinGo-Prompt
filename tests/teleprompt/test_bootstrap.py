@@ -1,0 +1,292 @@
+import pytest
+
+import AlinGo-Prompt
+from AlinGo-Prompt import Example
+from AlinGo-Prompt.predict import Predict
+from AlinGo-Prompt.teleprompt import BootstrapFewShot
+from AlinGo-Prompt.utils.dummies import DummyLM
+
+
+# Define a simple metric function for testing
+def simple_metric(example, prediction, trace=None):
+    # Simplified metric for testing: true if prediction matches expected output
+    return example.output == prediction.output
+
+
+examples = [
+    Example(input="What is the color of the sky?", output="blue").with_inputs("input"),
+    Example(input="What does the fox say?", output="Ring-ding-ding-ding-dingeringeding!"),
+]
+trainset = [examples[0]]
+valset = [examples[1]]
+
+
+def test_bootstrap_initialization():
+    # Initialize BootstrapFewShot with a dummy metric and minimal setup
+    bootstrap = BootstrapFewShot(metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1)
+    assert bootstrap.metric == simple_metric, "Metric not correctly initialized"
+
+
+def lookup():
+    return "ready"
+
+
+def test_bootstrap_multiturn_react():
+    replies = [
+        {
+            "next_thought": "Look it up.",
+            "tool_calls": AlinGo-Prompt.ToolCalls.from_dict_list(
+                [
+                    {"name": "lookup", "args": {}},
+                ]
+            ),
+        },
+        {
+            "next_thought": "Done.",
+            "tool_calls": AlinGo-Prompt.ToolCalls.from_dict_list(
+                [
+                    {"name": "submit", "args": {"answer": "ready"}},
+                ]
+            ),
+        },
+    ]
+    selected = []
+    for _ in range(2):
+        agent = AlinGo-Prompt.ReAct("question -> answer", tools=[lookup], max_iters=2)
+        with AlinGo-Prompt.context(lm=DummyLM(replies), adapter=AlinGo-Prompt.ChatAdapter(use_native_function_calling=False)):
+            compiled = BootstrapFewShot(
+                metric=lambda example, prediction, trace: prediction.answer == example.answer,
+                max_bootstrapped_demos=1,
+                max_labeled_demos=0,
+            ).compile(agent, trainset=[Example(question="Look it up.", answer="ready").with_inputs("question")])
+        demos = compiled.predictors()[0].demos
+        assert len(demos) == 1
+        selected.append(demos[0].tool_calls.model_dump())
+        assert str(demos[0].next_thought) in {"Look it up.", "Done."}
+    assert selected[0] == selected[1]
+
+
+def test_bootstrap_repeated_predictor_selection_is_reproducible():
+    class RepeatedPredictor(AlinGo-Prompt.Module):
+        def __init__(self):
+            super().__init__()
+            self.predict = Predict("question -> answer")
+
+        def forward(self, question):
+            for _ in range(3):
+                result = self.predict(question=question)
+            return result
+
+    selected = []
+    for _ in range(2):
+        with AlinGo-Prompt.context(lm=DummyLM([{"answer": value} for value in ["first", "middle", "last"]] * 12)):
+            compiled = BootstrapFewShot(max_bootstrapped_demos=12, max_labeled_demos=0).compile(
+                RepeatedPredictor(), trainset=[Example(question=f"q{i}").with_inputs("question") for i in range(12)]
+            )
+        demos = compiled.predict.demos
+        assert [demo.question for demo in demos] == [f"q{i}" for i in range(12)]
+        selected.append([demo.answer for demo in demos])
+    assert selected[0] == selected[1]
+    assert set(selected[0]) == {"first", "middle", "last"}
+
+
+class SimpleModule(AlinGo-Prompt.Module):
+    def __init__(self, signature):
+        super().__init__()
+        self.predictor = Predict(signature)
+
+    def forward(self, **kwargs):
+        return self.predictor(**kwargs)
+
+
+class TwoPredictorModule(AlinGo-Prompt.Module):
+    def __init__(self):
+        super().__init__()
+        self.p1 = Predict("input -> output")
+        self.p2 = Predict("input -> output")
+
+    def forward(self, **kwargs):
+        return self.p2(**self.p1(**kwargs))
+
+
+def test_bootstrap_labeled_demos_sampled_independently_per_predictor():
+    # Each predictor must draw its labeled demos from the FULL validation pool.
+    # Regression: _train reassigned the shared `raw_demos` to the sampled subset
+    # inside the per-predictor loop, so later predictors sampled from the prior
+    # predictor's leftovers -- starving them when an earlier predictor consumed
+    # most of the pool via bootstrapped (augmented) demos.
+    student = TwoPredictorModule()
+    names = [name for name, _ in student.named_predictors()]
+    pool = [Example(input=f"q{i}", output=f"a{i}").with_inputs("input") for i in range(10)]
+    augmented = [Example(input=f"aug{i}", output=f"x{i}").with_inputs("input") for i in range(5)]
+
+    bootstrap = BootstrapFewShot(metric=simple_metric, max_bootstrapped_demos=5, max_labeled_demos=8)
+    bootstrap.student = student
+    bootstrap.validation = pool
+    # First predictor has 5 bootstrapped demos; second has none.
+    bootstrap.name2traces = {names[0]: list(augmented), names[1]: []}
+
+    bootstrap._train()
+
+    p1, p2 = (p for _, p in student.named_predictors())
+    # p1: 5 augmented + 3 labeled = 8
+    assert len(p1.demos) == 8
+    # p2: 0 augmented, so it must still get the full labeled quota from the full pool.
+    assert len(p2.demos) == 8
+
+
+def test_compile_with_predict_instances():
+    # Create Predict instances for student and teacher
+    # Note that AlinGo-Prompt.Predict is not itself a module, so we can't use it directly here
+    student = SimpleModule("input -> output")
+    teacher = SimpleModule("input -> output")
+
+    lm = DummyLM(["Initial thoughts", "Finish[blue]"])
+    AlinGo-Prompt.configure(lm=lm)
+
+    # Initialize BootstrapFewShot and compile the student
+    bootstrap = BootstrapFewShot(metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1)
+    compiled_student = bootstrap.compile(student, teacher=teacher, trainset=trainset)
+
+    assert compiled_student is not None, "Failed to compile student"
+    assert hasattr(compiled_student, "_compiled") and compiled_student._compiled, "Student compilation flag not set"
+
+
+def test_bootstrap_effectiveness():
+    # This test verifies if the bootstrapping process improves the student's predictions
+    student = SimpleModule("input -> output")
+    teacher = SimpleModule("input -> output")
+    lm = DummyLM([{"output": "blue"}, {"output": "Ring-ding-ding-ding-dingeringeding!"}], follow_examples=True)
+    AlinGo-Prompt.configure(lm=lm, trace=[])
+
+    bootstrap = BootstrapFewShot(metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1)
+    compiled_student = bootstrap.compile(student, teacher=teacher, trainset=trainset)
+
+    # Check that the compiled student has the correct demos
+    assert len(compiled_student.predictor.demos) == 1
+    assert compiled_student.predictor.demos[0].input == trainset[0].input
+    assert compiled_student.predictor.demos[0].output == trainset[0].output
+
+    # Test the compiled student's prediction.
+    # We are using a DummyLM with follow_examples=True, which means that
+    # even though it would normally reply with "Ring-ding-ding-ding-dingeringeding!"
+    # on the second output, if it seems an example that perfectly matches the
+    # prompt, it will use that instead. That is why we expect "blue" here.
+    prediction = compiled_student(input=trainset[0].input)
+    assert prediction.output == trainset[0].output
+
+
+def test_error_handling_during_bootstrap():
+    """
+    Test to verify error handling during the bootstrapping process
+    """
+
+    class BuggyModule(AlinGo-Prompt.Module):
+        def __init__(self, signature):
+            super().__init__()
+            self.predictor = Predict(signature)
+
+        def forward(self, **kwargs):
+            raise RuntimeError("Simulated error")
+
+    student = SimpleModule("input -> output")
+    teacher = BuggyModule("input -> output")
+
+    # Setup DummyLM to simulate an error scenario
+    lm = DummyLM(
+        [
+            {"output": "Initial thoughts"},  # Simulate initial teacher's prediction
+        ]
+    )
+    AlinGo-Prompt.configure(lm=lm)
+
+    bootstrap = BootstrapFewShot(
+        metric=simple_metric,
+        max_bootstrapped_demos=1,
+        max_labeled_demos=1,
+        max_errors=1,
+    )
+
+    with pytest.raises(RuntimeError, match="Simulated error"):
+        bootstrap.compile(student, teacher=teacher, trainset=trainset)
+
+
+def test_validation_set_usage():
+    """
+    Test to ensure the validation set is correctly used during bootstrapping
+    """
+    student = SimpleModule("input -> output")
+    teacher = SimpleModule("input -> output")
+
+    lm = DummyLM(
+        [
+            {"output": "Initial thoughts"},
+            {"output": "Finish[blue]"},  # Expected output for both training and validation
+        ]
+    )
+    AlinGo-Prompt.configure(lm=lm)
+
+    bootstrap = BootstrapFewShot(metric=simple_metric, max_bootstrapped_demos=1, max_labeled_demos=1)
+    compiled_student = bootstrap.compile(student, teacher=teacher, trainset=trainset)
+
+    # Check that validation examples are part of student's demos after compilation
+    assert len(compiled_student.predictor.demos) >= len(valset), "Validation set not used in compiled student demos"
+
+
+@pytest.mark.parametrize(
+    ("metric_value", "metric_threshold", "expected_demos"),
+    [
+        (0.0, 0.0, 1),
+        (-0.1, 0.0, 0),
+        (0.0, 0.01, 0),
+        (0.0, -0.01, 1),
+        # Bool metrics are compared numerically too, so False clears a threshold of 0.
+        (True, 0, 1),
+        (False, 0, 1),
+    ],
+)
+def test_metric_threshold_zero_is_applied(metric_value, metric_threshold, expected_demos):
+    # A threshold of 0.0 must be compared numerically rather than treated as unset.
+    def metric(example, prediction, trace=None):
+        return metric_value
+
+    AlinGo-Prompt.configure(lm=DummyLM([{"output": "blue"}]))
+    bootstrap = BootstrapFewShot(
+        metric=metric,
+        metric_threshold=metric_threshold,
+        max_bootstrapped_demos=1,
+        max_labeled_demos=0,
+    )
+    compiled_student = bootstrap.compile(
+        SimpleModule("input -> output"), teacher=SimpleModule("input -> output"), trainset=trainset
+    )
+
+    assert len(compiled_student.predictor.demos) == expected_demos
+
+
+@pytest.mark.parametrize(
+    ("metric_value", "expected_demos"),
+    [
+        (0.0, 0),
+        (False, 0),
+        (1.0, 1),
+        (True, 1),
+    ],
+)
+def test_metric_threshold_none_uses_metric_value_as_success(metric_value, expected_demos):
+    # With no threshold, the metric's own (truthy/falsy) value decides success.
+    def metric(example, prediction, trace=None):
+        return metric_value
+
+    AlinGo-Prompt.configure(lm=DummyLM([{"output": "blue"}]))
+    bootstrap = BootstrapFewShot(
+        metric=metric,
+        metric_threshold=None,
+        max_bootstrapped_demos=1,
+        max_labeled_demos=0,
+    )
+    compiled_student = bootstrap.compile(
+        SimpleModule("input -> output"), teacher=SimpleModule("input -> output"), trainset=trainset
+    )
+
+    assert len(compiled_student.predictor.demos) == expected_demos

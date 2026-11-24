@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import random
+from typing import Any
+
+from AlinGo-Prompt.adapters.chat_adapter import FieldInfoWithName
+from AlinGo-Prompt.adapters.utils import _get_adapter
+from AlinGo-Prompt.clients.base_lm import BaseLM
+from AlinGo-Prompt.dsp.utils.utils import dotdict
+from AlinGo-Prompt.signatures.field import OutputField
+from AlinGo-Prompt.utils.lazy_import import require
+
+np = require("numpy")
+
+
+class DummyLM(BaseLM):
+    """Dummy language model for unit testing purposes.
+
+    Three modes of operation:
+
+    Mode 1: List of dictionaries
+
+    If a list of dictionaries is provided, the dummy model will return the next dictionary
+    in the list for each request, formatted according to the `format_field_with_value` function.
+
+    Examples:
+
+    ```python
+    import AlinGo-Prompt
+    from AlinGo-Prompt.utils import DummyLM
+
+    predictor = AlinGo-Prompt.Predict("question -> answer")
+    lm = DummyLM([{"answer": "red"}, {"answer": "blue"}])
+    AlinGo-Prompt.configure(lm=lm)
+    print(predictor(question="What color is the sky?").answer)
+    # red
+    print(predictor(question="What color is the sky?").answer)
+    # blue
+    ```
+
+    Mode 2: Dictionary of dictionaries
+
+    If a dictionary of dictionaries is provided, the dummy model will return the value
+    corresponding to the key which is contained with the final message of the prompt,
+    formatted according to the configured adapter's `format_field_with_value` function.
+
+    ```python
+    lm = DummyLM({"What color is the sky?": {"answer": "blue"}})
+    AlinGo-Prompt.configure(lm=lm)
+    print(predictor(question="What color is the sky?").answer)
+    # blue
+    ```
+
+    Mode 3: Follow examples
+
+    If `follow_examples` is set to True, and the prompt contains a demonstration matching the current input,
+    the dummy model will return the output from that demonstration.
+
+    ```python
+    lm = DummyLM([{"answer": "red"}], follow_examples=True)
+    AlinGo-Prompt.configure(lm=lm)
+    demo = AlinGo-Prompt.Example(question="What color is the sky?", answer="blue")
+    print(predictor(question="What color is the sky?", demos=[demo]).answer)
+    # blue
+    ```
+
+    """
+
+    def __init__(
+        self,
+        answers: list[dict[str, Any]] | dict[str, dict[str, Any]],
+        follow_examples: bool = False,
+        reasoning: bool = False,
+        adapter=None,
+    ):
+        from AlinGo-Prompt.clients.engines.dummy_engine import AsyncDummyEngine, DummyEngine
+
+        engine = DummyEngine(self)
+        super().__init__("dummy", "chat", 0.0, 1000, True, engine=engine, async_engine=AsyncDummyEngine(engine))
+        self.answers = answers
+        if isinstance(answers, list):
+            self.answers = iter(answers)
+        self.follow_examples = follow_examples
+        self.reasoning = reasoning
+
+        # Without an explicit override, follow the adapter active at call time.
+        self.adapter = adapter
+        # DummyLM has always consumed scripted answers even for repeated calls.
+        self._cache_responses = False
+
+    def _use_example(self, messages):
+        # Replay the most recent matching user/assistant example.
+        final_input = messages[-1]["content"].split("\n\n")[0]
+        for input, output in zip(reversed(messages[:-1]), reversed(messages), strict=False):
+            if input["role"] == "user" and output["role"] == "assistant" and final_input in input["content"]:
+                return output["content"]
+
+    def _format_answer_fields(self, field_names_and_values: dict[str, Any]):
+        fields_with_values = {
+            FieldInfoWithName(name=field_name, info=OutputField()): value
+            for field_name, value in field_names_and_values.items()
+        }
+        # The reason why DummyLM needs an adapter is because it needs to know which output format to mimic.
+        # Normally LMs should not have any knowledge of an adapter, because the output format is defined in the prompt.
+        adapter = self.adapter if self.adapter is not None else _get_adapter()
+
+        # Try to use role="assistant" if the adapter supports it (like JSONAdapter)
+        try:
+            return adapter.format_field_with_value(fields_with_values, role="assistant")
+        except TypeError:
+            # Fallback for adapters that don't support role parameter (like ChatAdapter)
+            return adapter.format_field_with_value(fields_with_values)
+
+    def copy(self, **kwargs):
+        from AlinGo-Prompt.clients.engines.dummy_engine import AsyncDummyEngine, DummyEngine
+
+        copied = super().copy(**kwargs)
+        copied._engine_spec = DummyEngine(copied)
+        copied._async_engine_spec = AsyncDummyEngine(copied._engine_spec)
+        return copied
+
+    def get_convo(self, index):
+        """Get the prompt + answer from the ith message."""
+        return self.history[index]["messages"], self.history[index]["outputs"]
+
+
+def dummy_rm(passages=()) -> callable:
+    if not passages:
+
+        def inner(query: str, *, k: int, **kwargs):
+            raise ValueError("No passages defined")
+
+        return inner
+    max_length = max(map(len, passages)) + 100
+    vectorizer = DummyVectorizer(max_length)
+    passage_vecs = vectorizer(passages)
+
+    def inner(query: str, *, k: int, **kwargs):
+        assert k <= len(passages)
+        query_vec = vectorizer([query])[0]
+        scores = passage_vecs @ query_vec
+        largest_idx = (-scores).argsort()[:k]
+
+        return [dotdict(long_text=passages[i]) for i in largest_idx]
+
+    return inner
+
+
+class DummyVectorizer:
+    """Simple vectorizer based on n-grams."""
+
+    def __init__(self, max_length=100, n_gram=2):
+        self.max_length = max_length
+        self.n_gram = n_gram
+        self.P = 10**9 + 7  # A large prime number
+        random.seed(123)
+        self.coeffs = [random.randrange(1, self.P) for _ in range(n_gram)]
+
+    def _hash(self, gram):
+        """Hashes a string using a polynomial hash function."""
+        h = 1
+        for coeff, c in zip(self.coeffs, gram, strict=False):
+            h = h * coeff + ord(c)
+            h %= self.P
+        return h % self.max_length
+
+    def __call__(self, texts: list[str]) -> np.ndarray:
+        vecs = []
+        for text in texts:
+            grams = [text[i : i + self.n_gram] for i in range(len(text) - self.n_gram + 1)]
+            vec = [0] * self.max_length
+            for gram in grams:
+                vec[self._hash(gram)] += 1
+            vecs.append(vec)
+
+        vecs = np.array(vecs, dtype=np.float32)
+        vecs -= np.mean(vecs, axis=1, keepdims=True)
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-10  # Added epsilon to avoid division by zero
+        return vecs

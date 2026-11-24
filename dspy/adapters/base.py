@@ -1,0 +1,681 @@
+import json
+import logging
+from collections.abc import Iterator
+from dataclasses import dataclass, replace
+from typing import Any, get_origin
+
+from AlinGo-Prompt._vendor.lm15.providers.common import MEDIA_KINDS
+from AlinGo-Prompt._vendor.lm15.serde import continuation_to_dict
+from AlinGo-Prompt._vendor.lm15.types import Part, ToolResultPart
+from AlinGo-Prompt.adapters.types import History, Type
+from AlinGo-Prompt.adapters.types.base_type import CUSTOM_TYPE_START_IDENTIFIER, parts_from_text
+from AlinGo-Prompt.adapters.types.citation import Citations
+from AlinGo-Prompt.adapters.types.reasoning import Reasoning
+from AlinGo-Prompt.adapters.types.tool import Tool, ToolCalls
+from AlinGo-Prompt.adapters.utils import apply_output_field_defaults, serialize_for_json
+from AlinGo-Prompt.clients.base_lm import BaseLM
+from AlinGo-Prompt.clients.call_result import response_text
+from AlinGo-Prompt.clients.capabilities import tool_result_media, with_capability_planning
+from AlinGo-Prompt.clients.requests import build_request
+from AlinGo-Prompt.dsp.utils.settings import settings
+from AlinGo-Prompt.lm15 import Message, Request, Response, TextPart
+from AlinGo-Prompt.signatures.signature import Signature
+from AlinGo-Prompt.utils.callback import BaseCallback, with_callbacks
+from AlinGo-Prompt.utils.exceptions import AdapterParseError
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_NATIVE_RESPONSE_TYPES = [Citations, Reasoning]
+
+
+@dataclass(frozen=True)
+class Prompt:
+    """What an adapter renders: system instructions plus the conversation turns.
+
+    Both halves use `AlinGo-Prompt.lm15` objects. `messages` are `Message`s in user,
+    assistant and tool roles; `system` is the instruction text (or content
+    parts) that becomes `Request.system`.
+    """
+
+    messages: tuple[Message, ...]
+    system: str | tuple | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "messages", tuple(self.messages))
+
+
+def user_message(text: str) -> Message:
+    """A user message whose custom-type markers become lm15 content parts."""
+    return Message.user(parts_from_text(text))
+
+
+def prompt_to_openai_messages(prompt: Prompt) -> list[dict[str, Any]]:
+    """Write a prompt as OpenAI chat messages, for fine-tuning files and display.
+
+    Reuses the SDK boundary's lm15 writer and its audio/file compatibility slots.
+    """
+    from AlinGo-Prompt.clients.lm15_boundary import request_kwargs
+    from AlinGo-Prompt.lm15 import Request
+
+    request = Request(model="conversion-only", messages=prompt.messages, system=prompt.system)
+    return request_kwargs(request, "chat")["messages"]
+
+
+class Adapter:
+    """Base Adapter class.
+
+    The Adapter serves as the interface layer between DSPy module/signature and Language Models (LMs). It handles the
+    complete transformation pipeline from DSPy inputs to LM calls and back to structured outputs.
+
+    Key responsibilities:
+        - Transform user inputs and signatures into properly formatted LM prompts, which also instructs the LM to format
+            the response in a specific format.
+        - Parse LM outputs into dictionaries matching the signature's output fields.
+        - Enable/disable native LM features (function calling, citations, etc.) based on configuration.
+        - Handle conversation history, few-shot examples, and custom type processing.
+
+    The adapter pattern allows DSPy to work with different LM interfaces while maintaining a consistent programming
+    model for users.
+    """
+
+    def __init__(
+        self,
+        callbacks: list[BaseCallback] | None = None,
+        use_native_function_calling: bool = False,
+        native_response_types: list[type[Type]] | None = None,
+        parallel_tool_calls: bool | None = None,
+    ):
+        """
+        Args:
+            callbacks: List of callback functions to execute during `format()` and `parse()` methods. Callbacks can be
+                used for logging, monitoring, or custom processing. Defaults to None (empty list).
+            use_native_function_calling: Whether to enable native function calling capabilities when the LM supports it.
+                If True, the adapter will automatically configure function calling when input fields contain `AlinGo-Prompt.Tool`
+                or `list[AlinGo-Prompt.Tool]` types. Defaults to False.
+            native_response_types: List of output field types that should be handled by native LM features rather than
+                adapter parsing. For example, `AlinGo-Prompt.Citations` can be populated directly by citation APIs
+                (e.g., Anthropic's citation feature). Defaults to `[Citations]`.
+            parallel_tool_calls: Whether to request provider-side parallel tool-call generation when native function
+                calling is active. If None, the adapter does not set the provider option. Defaults to None.
+        """
+        self.callbacks = callbacks or []
+        self.use_native_function_calling = use_native_function_calling
+        self.parallel_tool_calls = parallel_tool_calls
+        self.native_response_types = native_response_types or _DEFAULT_NATIVE_RESPONSE_TYPES
+
+    def __init_subclass__(cls, **kwargs) -> None:
+        super().__init_subclass__(**kwargs)
+
+        # Decorate format() and parse() method with with_callbacks
+        cls.format = with_callbacks(cls.format)
+        cls.parse = with_callbacks(cls.parse)
+
+    def _call_preprocess(
+        self,
+        lm: BaseLM,
+        lm_kwargs: dict[str, Any],
+        signature: type[Signature],
+        inputs: dict[str, Any],
+    ) -> type[Signature]:
+        """Decide which fields the model handles natively, and adjust the LM options.
+
+        Returns the signature the prompt is rendered from: fields handled by a
+        native feature (tool calling, reasoning, ...) are removed from it and
+        filled in from the `Response` in `_call_postprocess`.
+        """
+        original_signature = signature
+        if not self.use_native_function_calling:
+            for key in ("tools", "tool_choice", "parallel_tool_calls"):
+                lm_kwargs.pop(key, None)
+        else:
+            tool_call_input_field_name = self._get_tool_call_input_field_name(signature)
+            tool_call_output_field_name = self._get_tool_call_output_field_name(signature)
+
+            if tool_call_output_field_name and tool_call_input_field_name is None:
+                raise ValueError(
+                    f"You provided an output field {tool_call_output_field_name} to receive the tool calls information, "
+                    "but did not provide any tools as the input. Please provide a list of tools as the input by adding an "
+                    "input field with type `list[AlinGo-Prompt.Tool]`."
+                )
+
+            if tool_call_output_field_name and lm.supports_function_calling:
+                tools = inputs[tool_call_input_field_name]
+                tools = tools if isinstance(tools, list) else [tools]
+
+                lm_kwargs["tools"] = [tool.as_function_tool() for tool in tools]
+                if self.parallel_tool_calls is not None and lm_kwargs.get("parallel_tool_calls") is None:
+                    lm_kwargs["parallel_tool_calls"] = self.parallel_tool_calls
+                if lm_kwargs.get("parallel_tool_calls") is not None:
+                    lm_kwargs.setdefault("tool_choice", "auto")
+
+                signature = signature.delete(tool_call_output_field_name)
+                signature = signature.delete(tool_call_input_field_name)
+            elif tool_call_output_field_name:
+                for key in ("tools", "tool_choice", "parallel_tool_calls"):
+                    lm_kwargs.pop(key, None)
+
+        # Custom types that use native LM features, e.g., reasoning, citations.
+        for name, field in signature.output_fields.items():
+            if (
+                isinstance(field.annotation, type)
+                and field.annotation in self.native_response_types
+                and issubclass(field.annotation, Type)
+            ):
+                signature = field.annotation.adapt_to_native_lm_feature(signature, name, lm, lm_kwargs)
+
+        # Only surviving default reasoning fields need the explicit plan fallback.
+        for name in signature.output_fields:
+            fallback_name = Reasoning._fallback_field_name(original_signature, name)
+            if fallback_name != name:
+                signature = signature.with_updated_fields(name, __AlinGo-Prompt_reasoning_field=name)
+                signature = Signature(
+                    {fallback_name if key == name else key: field for key, field in signature.fields.items()},
+                    signature.instructions,
+                )
+
+        return signature
+
+    def _call_postprocess(
+        self,
+        processed_signature: type[Signature],
+        original_signature: type[Signature],
+        responses: list[Response],
+    ) -> list[dict[str, Any]]:
+        """Parse each `Response` into the output fields of the original signature."""
+        values = []
+
+        tool_call_output_field_name = self._get_tool_call_output_field_name(original_signature)
+
+        for response in responses:
+            text = response_text(response)
+            tool_calls = response.tool_calls if tool_call_output_field_name else []
+
+            if text and not tool_calls:
+                try:
+                    value = self.parse(processed_signature, text)
+                except AdapterParseError as e:
+                    # Expose the predictor's signature and field names to callers, while
+                    # preserving the parser's diagnostic message and raw LM response.
+                    e.signature = original_signature
+                    if e.parsed_result is not None:
+                        e.parsed_result = e.parsed_result.copy()
+                        for name, field in processed_signature.output_fields.items():
+                            if original_name := field.json_schema_extra.get("__AlinGo-Prompt_reasoning_field"):
+                                if name in e.parsed_result:
+                                    e.parsed_result[original_name] = e.parsed_result.pop(name)
+                    raise
+            elif tool_calls:
+                try:
+                    value = self.parse(processed_signature, text) if text and processed_signature.output_fields else {}
+                except AdapterParseError:
+                    value = {}
+            else:
+                raise AdapterParseError(
+                    adapter_name=type(self).__name__,
+                    signature=original_signature,
+                    lm_response=text or "",
+                    message="The LM returned an empty or null response.",
+                )
+
+            for name, field in processed_signature.output_fields.items():
+                if original_name := field.json_schema_extra.get("__AlinGo-Prompt_reasoning_field"):
+                    if name in value:
+                        value[original_name] = value.pop(name)
+
+            # Fields removed for native features are absent from the processed parse
+            value = apply_output_field_defaults(original_signature, value)
+            for field_name in original_signature.output_fields:
+                value.setdefault(field_name, None)
+
+            if tool_calls:
+                value[tool_call_output_field_name] = ToolCalls.from_dict_list(
+                    [
+                        {
+                            "id": call.id, "name": call.name, "args": call.input,
+                            "continuation": [continuation_to_dict(state) for state in call.continuation],
+                        }
+                        for call in tool_calls
+                    ]
+                )
+
+            # Custom types that read their value from the response itself.
+            for name, field in original_signature.output_fields.items():
+                if (
+                    isinstance(field.annotation, type)
+                    and field.annotation in self.native_response_types
+                    and issubclass(field.annotation, Type)
+                    and not (
+                        field.annotation is Reasoning
+                        and Reasoning._fallback_field_name(original_signature, name) in processed_signature.output_fields
+                    )
+                ):
+                    parsed_value = field.annotation.parse_lm_response(response)
+                    if parsed_value is not None:
+                        value[name] = parsed_value
+
+            if response.logprobs is not None:
+                value["logprobs"] = response.logprobs
+
+            values.append(value)
+
+        return values
+
+    @with_capability_planning
+    def __call__(
+        self,
+        lm: BaseLM,
+        lm_kwargs: dict[str, Any],
+        signature: type[Signature],
+        demos: list[dict[str, Any]],
+        inputs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Execute the adapter pipeline: format inputs, call LM, and parse outputs.
+
+        Args:
+            lm: The Language Model instance to use for generation. Must be an instance of `AlinGo-Prompt.BaseLM`.
+            lm_kwargs: Additional keyword arguments to pass to the LM call (e.g., temperature, max_tokens). These are
+                passed directly to the LM.
+            signature: The DSPy signature associated with this LM call.
+            demos: List of few-shot examples to include in the prompt. Each dictionary should contain keys matching the
+                signature's input and output field names. Examples are formatted as user/assistant message pairs.
+            inputs: The current input values for this call. Keys must match the signature's input field names.
+
+        Returns:
+            List of dictionaries representing parsed LM responses. Each dictionary contains keys matching the
+            signature's output field names. For multiple generations (n > 1), returns multiple dictionaries.
+        """
+        processed_signature = self._call_preprocess(lm, lm_kwargs, signature, inputs)
+        prompt = self.format(processed_signature, demos, inputs)
+        request = _place_tool_result_media(build_request(lm, prompt, lm_kwargs), lm, lm_kwargs)
+        if settings.send_stream and settings.stream_listeners:
+            from AlinGo-Prompt.streaming.messages import _StreamSignature, sync_send_to_stream
+
+            sync_send_to_stream(settings.send_stream, _StreamSignature(id(settings.caller_predict), processed_signature))
+        responses = [lm(candidate, **options) for candidate, options in _candidate_calls(lm, lm_kwargs, request)]
+        return self._call_postprocess(processed_signature, signature, responses)
+
+    @with_capability_planning
+    async def acall(
+        self,
+        lm: BaseLM,
+        lm_kwargs: dict[str, Any],
+        signature: type[Signature],
+        demos: list[dict[str, Any]],
+        inputs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        processed_signature = self._call_preprocess(lm, lm_kwargs, signature, inputs)
+        prompt = self.format(processed_signature, demos, inputs)
+        request = _place_tool_result_media(build_request(lm, prompt, lm_kwargs), lm, lm_kwargs)
+        if settings.send_stream and settings.stream_listeners:
+            from AlinGo-Prompt.streaming.messages import _StreamSignature
+
+            await settings.send_stream.send(_StreamSignature(id(settings.caller_predict), processed_signature))
+        responses = [await lm.acall(candidate, **options) for candidate, options in _candidate_calls(lm, lm_kwargs, request)]
+        return self._call_postprocess(processed_signature, signature, responses)
+
+    def format(
+        self,
+        signature: type[Signature],
+        demos: list[dict[str, Any]],
+        inputs: dict[str, Any],
+    ) -> Prompt:
+        """Render the prompt for the LM call.
+
+        This method converts the DSPy structured input along with few-shot examples and conversation history into
+        a system instruction plus multiturn lm15 messages. For custom adapters, this method can be overridden to
+        customize the rendering.
+
+        The recommended structure is:
+        ```
+        Prompt(
+            system=system_message,  # field descriptions, field structure and task description
+            messages=(
+                # Begin few-shot examples
+                Message.user(few_shot_example_1_input),
+                Message.assistant(few_shot_example_1_output),
+                ...
+                # End few-shot examples
+                # Begin conversation history
+                Message.user(conversation_history_1_input),
+                Message.assistant(conversation_history_1_output),
+                ...
+                # End conversation history
+                Message.user(current_input),
+            ),
+        )
+        ```
+
+        Args:
+            signature: The DSPy signature for which to format the prompt.
+            demos: A list of few-shot examples.
+            inputs: The input arguments to the DSPy module.
+
+        Returns:
+            The rendered `Prompt`.
+        """
+        inputs_copy = dict(inputs)
+        fallback_names = {
+            field.json_schema_extra["__AlinGo-Prompt_reasoning_field"]: name
+            for name, field in signature.output_fields.items()
+            if "__AlinGo-Prompt_reasoning_field" in field.json_schema_extra
+        }
+        if fallback_names:
+            def remap(values):
+                return {fallback_names.get(key, key): value for key, value in values.items()}
+
+            demos = [remap(demo) for demo in demos]
+            for name, field in signature.input_fields.items():
+                if field.annotation is History and name in inputs_copy:
+                    inputs_copy[name] = inputs_copy[name]._remap_fields(fallback_names)
+
+        # If the signature and inputs have conversation history, we need to format the conversation history and
+        # remove the history field from the signature.
+        history_field_name = self._get_history_field_name(signature)
+        if history_field_name:
+            # In order to format the conversation history, we need to remove the history field from the signature.
+            signature_without_history = signature.delete(history_field_name)
+            conversation_history = self.format_conversation_history(
+                signature_without_history,
+                history_field_name,
+                inputs_copy,
+            )
+
+        messages = []
+        system_message = self.format_system_message(signature)
+        messages.extend(self.format_demos(signature, demos))
+        content = self.format_user_message_content(
+            signature_without_history if history_field_name else signature, inputs_copy, main_request=True
+        )
+        if history_field_name:
+            messages.extend(conversation_history)
+        if content:
+            messages.append(user_message(content))
+
+        return Prompt(system=system_message or None, messages=tuple(messages))
+
+    def format_system_message(self, signature: type[Signature]) -> str:
+        """Format the system message for the LM call.
+
+
+        Args:
+            signature: The DSPy signature for which to format the system message.
+        """
+        return (
+            f"{self.format_field_description(signature)}\n"
+            f"{self.format_field_structure(signature)}\n"
+            f"{self.format_task_description(signature)}"
+        )
+
+    def format_field_description(self, signature: type[Signature]) -> str:
+        """Format the field description for the system message.
+
+        This method formats the field description for the system message. It should return a string that contains
+        the field description for the input fields and the output fields.
+
+        Args:
+            signature: The DSPy signature for which to format the field description.
+
+        Returns:
+            A string that contains the field description for the input fields and the output fields.
+        """
+        raise NotImplementedError
+
+    def format_field_structure(self, signature: type[Signature]) -> str:
+        """Format the field structure for the system message.
+
+        This method formats the field structure for the system message. It should return a string that dictates the
+        format the input fields should be provided to the LM, and the format the output fields will be in the response.
+        Refer to the ChatAdapter and JsonAdapter for an example.
+
+        Args:
+            signature: The DSPy signature for which to format the field structure.
+        """
+        raise NotImplementedError
+
+    def format_task_description(self, signature: type[Signature]) -> str:
+        """Format the task description for the system message.
+
+        This method formats the task description for the system message. In most cases this is just a thin wrapper
+        over `signature.instructions`.
+
+        Args:
+            signature: The DSPy signature of the DSpy module.
+
+        Returns:
+            A string that describes the task.
+        """
+        raise NotImplementedError
+
+    def format_user_message_content(
+        self,
+        signature: type[Signature],
+        inputs: dict[str, Any],
+        prefix: str = "",
+        suffix: str = "",
+        main_request: bool = False,
+    ) -> str:
+        """Format the user message content.
+
+        This method formats the user message content, which can be used in formatting few-shot examples, conversation
+        history, and the current input.
+
+        Args:
+            signature: The DSPy signature for which to format the user message content.
+            inputs: The input arguments to the DSPy module.
+            prefix: A prefix to the user message content.
+            suffix: A suffix to the user message content.
+
+        Returns:
+            A string that contains the user message content.
+        """
+        raise NotImplementedError
+
+    def format_assistant_message_content(
+        self,
+        signature: type[Signature],
+        outputs: dict[str, Any],
+        missing_field_message: str | None = None,
+    ) -> str:
+        """Format the assistant message content.
+
+        This method formats the assistant message content, which can be used in formatting few-shot examples,
+        conversation history.
+
+        Args:
+            signature: The DSPy signature for which to format the assistant message content.
+            outputs: The output fields to be formatted.
+            missing_field_message: A message to be used when a field is missing.
+
+        Returns:
+            A string that contains the assistant message content.
+        """
+        raise NotImplementedError
+
+    def format_demos(self, signature: type[Signature], demos: list[dict[str, Any]]) -> list[Message]:
+        """Format the few-shot examples.
+
+        This method formats the few-shot examples as multiturn messages.
+
+        Args:
+            signature: The DSPy signature for which to format the few-shot examples.
+            demos: A list of few-shot examples, each element is a dictionary with keys of the input and output fields of
+                the signature.
+
+        Returns:
+            A list of multiturn lm15 messages.
+        """
+        complete_demos = []
+        incomplete_demos = []
+
+        for demo in demos:
+            # Check if all fields are present and not None
+            is_complete = all(k in demo and demo[k] is not None for k in signature.fields)
+
+            # Check if demo has at least one input and one output field
+            has_input = any(k in demo for k in signature.input_fields)
+            has_output = any(k in demo for k in signature.output_fields)
+
+            if is_complete:
+                complete_demos.append(demo)
+            elif has_input and has_output:
+                # We only keep incomplete demos that have at least one input and one output field
+                incomplete_demos.append(demo)
+
+        messages = []
+
+        incomplete_demo_prefix = "This is an example of the task, though some input or output fields are not supplied."
+        for demo in incomplete_demos:
+            messages.append(user_message(self.format_user_message_content(signature, demo, prefix=incomplete_demo_prefix)))
+            messages.append(Message.assistant(self.format_assistant_message_content(
+                signature, demo, missing_field_message="Not supplied for this particular example. "
+            )))
+
+        for demo in complete_demos:
+            messages.append(user_message(self.format_user_message_content(signature, demo)))
+            messages.append(Message.assistant(self.format_assistant_message_content(
+                signature, demo, missing_field_message="Not supplied for this conversation history message. "
+            )))
+
+        return messages
+
+    def _get_history_field_name(self, signature: type[Signature]) -> str | None:
+        for name, field in signature.input_fields.items():
+            if field.annotation == History:
+                return name
+        return None
+
+    def _get_tool_call_input_field_name(self, signature: type[Signature]) -> str | None:
+        for name, field in signature.input_fields.items():
+            # Look for annotation `list[AlinGo-Prompt.Tool]` or `AlinGo-Prompt.Tool`
+            origin = get_origin(field.annotation)
+            if origin is list and field.annotation.__args__[0] == Tool:
+                return name
+            if field.annotation == Tool:
+                return name
+        return None
+
+    def _get_tool_call_output_field_name(self, signature: type[Signature]) -> str | None:
+        for name, field in signature.output_fields.items():
+            if field.annotation == ToolCalls:
+                return name
+        return None
+
+    def format_conversation_history(
+        self,
+        signature: type[Signature],
+        history_field_name: str,
+        inputs: dict[str, Any],
+    ) -> list[Message]:
+        """Format the conversation history.
+
+        This method formats the conversation history and the current input as multiturn messages.
+
+        Args:
+            signature: The DSPy signature for which to format the conversation history.
+            history_field_name: The name of the history field in the signature.
+            inputs: The input arguments to the DSPy module.
+
+        Returns:
+            A list of multiturn lm15 messages.
+        """
+        if history_field_name not in inputs:
+            return []
+
+        messages = inputs[history_field_name].format(self, signature)
+        del inputs[history_field_name]
+        return messages
+
+    def parse(self, signature: type[Signature], completion: str) -> dict[str, Any]:
+        """Parse the LM output into a dictionary of the output fields.
+
+        This method parses the LM output into a dictionary of the output fields.
+
+        Args:
+            signature: The DSPy signature for which to parse the LM output.
+            completion: The LM output to be parsed.
+
+        Returns:
+            A dictionary of the output fields.
+        """
+        raise NotImplementedError
+
+
+def _candidate_calls(lm: BaseLM, lm_kwargs: dict[str, Any], request: Request) -> Iterator[tuple[Request, dict[str, Any]]]:
+    """One callable LM invocation per candidate, with independent cache identity.
+
+    A seeded group uses seed + candidate index, so separate provider calls do
+    not reset the sampler to the same seed. The first candidate and unseeded
+    calls are unchanged. Multiple candidates namespace the caller rollout and
+    index, so adjacent caller rollouts cannot overlap.
+    """
+    from AlinGo-Prompt.clients.requests import CLIENT_KEYS
+
+    n = lm_kwargs.get("n", lm_kwargs.get("num_generations"))
+    if n is None:
+        n = lm.kwargs.get("n", lm.kwargs.get("num_generations", 1))
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError("n must be a positive integer")
+
+    options = {}
+    for key in ("cache", "rollout_id", *CLIENT_KEYS):
+        if key in lm_kwargs and (key in CLIENT_KEYS or lm_kwargs[key] is not None):
+            options[key] = lm_kwargs[key]
+    rollout_id = options.get("rollout_id", lm.kwargs.get("rollout_id"))
+    for index in range(n):
+        if n == 1:
+            yield request, options
+        else:
+            candidate = request
+            if index and request.config.seed is not None:
+                candidate = replace(request, config=replace(request.config, seed=request.config.seed + index))
+            yield candidate, {**options, "rollout_id": ("AlinGo-Prompt.adapter.candidate", rollout_id, index)}
+
+
+def _place_tool_result_media(request: Request, lm: BaseLM, lm_kwargs: dict[str, Any]) -> Request:
+    """Move tool-result media the backend running ``request`` cannot carry into a user message after the results.
+
+    Chat Completions tool rows, for example, take text only. Each moved part leaves a placeholder in its tool
+    result, and the user message labels the parts with their tool call.
+    """
+    tool_results = [part for message in request.messages if message.role == "tool" for part in message.parts]
+    if not any(item.type in MEDIA_KINDS for part in tool_results for item in getattr(part, "content", ())):
+        return request
+    unsupported = MEDIA_KINDS - tool_result_media(lm, lm_kwargs, request)
+    messages = []
+    for message in request.messages:
+        results, attachments = [], []
+        for part in message.parts if message.role == "tool" else ():
+            moved = [item for item in part.content if item.type in unsupported] if isinstance(part, ToolResultPart) else []
+            if not moved:
+                results.append(part)
+                continue
+            content = tuple(
+                TextPart(f"[{item.type} attached in the next message]") if item.type in unsupported else item
+                for item in part.content
+            )
+            results.append(replace(part, content=content))
+            label = f"Attachments from tool call {part.id}" + (f" ({part.name})" if part.name else "") + ":"
+            attachments.extend([TextPart(label), *moved])
+        if attachments:
+            messages.extend([replace(message, parts=tuple(results)), Message.user(tuple(attachments))])
+        else:
+            messages.append(message)
+    return replace(request, messages=tuple(messages)) if len(messages) != len(request.messages) else request
+
+
+def _tool_result_content(value: Any) -> str | tuple[Part, ...]:
+    if isinstance(value, str):
+        content = value
+    else:
+        serialized = serialize_for_json(value)
+        # A bare custom type that formats to text renders as that text, as in `format_field_value`, not as a
+        # JSON string; one that serializes to structured data (e.g. `Score`) is JSON-encoded like any value.
+        is_text = isinstance(value, Type) and isinstance(serialized, str)
+        content = serialized if is_text else json.dumps(serialized, ensure_ascii=False)
+
+    if CUSTOM_TYPE_START_IDENTIFIER not in content:
+        return content
+    # Custom types such as `AlinGo-Prompt.Image` serialize to marker-wrapped content parts; send the parts so the
+    # provider receives the image itself rather than its encoding as text.
+    return parts_from_text(content)

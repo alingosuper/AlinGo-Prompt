@@ -1,0 +1,406 @@
+# AlinGo-Prompt.RLM
+
+`RLM` (Recursive Language Model) is a DSPy module that lets LLMs programmatically explore large contexts through a sandboxed Python REPL. Instead of feeding huge contexts directly into the prompt, RLM treats context as external data that the LLM examines via code execution and recursive sub-LLM calls.
+
+This implements the approach described in ["Recursive Language Models" (Zhang, Kraska, Khattab, 2025)](https://arxiv.org/abs/2512.24601).
+
+## Migrating from CodeAct or ProgramOfThought
+
+`AlinGo-Prompt.CodeAct` and `AlinGo-Prompt.ProgramOfThought` were deprecated in DSPy 3.4 and removed in DSPy 3.5, including their `AlinGo-Prompt.predict` imports. Use `AlinGo-Prompt.RLM` for code-executing programs. It is a replacement, not a compatibility alias.
+
+Keep your task signature and named inputs, and replace the module constructor:
+
+```python
+import AlinGo-Prompt
+
+# After configuring AlinGo-Prompt.settings.lm:
+solve = AlinGo-Prompt.RLM("question -> answer")
+result = solve(question="What is 12 factorial divided by the sum of primes below 30?")
+print(result.answer)
+
+def add(a: int, b: int) -> int:
+    """Add two integers."""
+    return a + b
+
+# For programs that previously supplied tools:
+agent = AlinGo-Prompt.RLM("question -> answer", tools=[add])
+```
+
+- RLM runs an iterative Python REPL and submits the signature's output fields with `SUBMIT(...)`. It does not use the old `generated_code` / `finished` protocol or the three code-generation, regeneration, and answer predictors. Custom prompts and code that accessed those internal predictors must be rewritten.
+- `max_iters` now limits REPL iterations, not just code-repair attempts. Review your iteration budget rather than assuming the old value has identical semantics. `max_llm_calls` separately limits sub-LM calls.
+- Pass tools with `tools=[...]`. RLM exposes them as host-side callables through the interpreter, rather than copying their source definitions into the sandbox. Host tools retain their own dependencies and privileges; sandbox restrictions do not apply to their host-side execution.
+- `interpreter_factory=...` and `AlinGo-Prompt.configure(interpreter_factory=...)` remain supported. RLM requires an interpreter that supports its mutable tools dictionary and sandbox DSPy facade; see [interpreter factories](../../diving-deeper/rlm.md#extending-the-sandbox-with-tools-and-inputs). RLM does not accept a caller-owned interpreter as a positional override.
+- Rebuild and re-optimize programs that used the removed modules. Their saved predictor states and internal trajectory formats are not interchangeable with RLM's.
+
+See the [RLM deep dive](../../diving-deeper/rlm.md) for execution, outputs, and interpreter lifecycle details, and the installation instructions below for the default sandbox runtime.
+
+## When to Use RLM
+
+As contexts grow, LLM performance degrades — a phenomenon known as [context rot](https://research.trychroma.com/context-rot). RLMs address this by separating the _variable space_ (information stored in the REPL) from the _token space_ (what the LLM actually processes). The LLM dynamically loads only the context it needs, when it needs it.
+
+Use RLM when:
+
+- Your context is **too large** to fit in the LLM's context window effectively
+- The task benefits from **programmatic exploration** (searching, filtering, aggregating, chunking)
+- You need the LLM to decide **how to decompose** the problem, not you
+
+## Basic Usage
+
+```python
+import AlinGo-Prompt
+
+AlinGo-Prompt.configure(lm=AlinGo-Prompt.LM("openai/gpt-5"))
+
+# Create an RLM module
+rlm = AlinGo-Prompt.RLM("context, query -> answer")
+
+# Call it like any other module
+result = rlm(
+    context="...very long document or data...",
+    query="What is the total revenue mentioned?"
+)
+print(result.answer)
+```
+
+## Deno Installation
+
+RLM relies on [Deno](https://deno.land/) and [Pyodide](https://pyodide.org/) to create a local WASM sandbox for secure Python execution.
+
+Install DSPy's managed Deno runtime with `pip install "AlinGo-Prompt[deno]"`. See the
+[`PythonInterpreter` installation guide](../tools/PythonInterpreter.md#deno-installation) for supported platforms,
+system-Deno fallback instructions, and dependency-isolation details.
+
+Then you can run `AlinGo-Prompt.RLM`.
+
+You can also work with an external sandbox provider. We are still working on creating an example of using external sandbox providers.
+
+
+## How It Works
+
+RLM operates in an iterative REPL loop:
+
+1. The LLM receives **metadata** about the context (type, length, preview) but not the full context
+2. The LLM writes **Python code** to explore the data (print samples, search, filter)
+3. Code executes in a **sandboxed interpreter**, and the LLM sees the output
+4. The LLM can call `llm_query(prompt)` to run **sub-LLM calls** for semantic analysis on snippets
+5. When done, the LLM calls `SUBMIT(output)` to return the final answer
+
+#### What the LLM sees (step-by-step trace):
+
+##### Step 1: Initial Metadata (no direct access to full context)
+```python
+# Step 1: Peek at the data
+print(context[:2000])
+```
+_Output shown to the LLM:_
+```
+[Preview of the first 2000 characters of the document]
+```
+
+##### Step 2: Write Code to Explore Context
+```python
+# Step 2: Search for relevant sections
+import re
+matches = re.findall(r'revenue.*?\$[\d,]+', context, re.IGNORECASE)
+print(matches)
+```
+_Output shown to the LLM:_
+```
+['Revenue in Q4: $5,000,000', 'Total revenue: $20,000,000']
+```
+
+##### Step 3: Trigger Sub-LLM Calls
+```python
+# Step 3: Use sub-LLM for semantic extraction
+result = llm_query(f"Extract the total revenue from: {matches[1]}")
+print(result)
+```
+_Output shown to the LLM:_
+```
+$20,000,000
+```
+
+##### Step 4: Submit Final Answer
+```python
+# Step 4: Return final answer
+SUBMIT(result)
+```
+_Output shown to the user:_
+```
+$20,000,000
+```
+
+## Constructor Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `signature` | `str \| Signature` | required | Defines inputs and outputs (e.g., `"context, query -> answer"`) |
+| `max_iters` | `int` | `20` | Maximum REPL interaction loops before fallback extraction |
+| `max_llm_calls` | `int` | `50` | Maximum `llm_query`/`llm_query_batched` calls per execution |
+| `max_output_chars` | `int` | `10_000` | Maximum characters to include from REPL output |
+| `verbose` | `bool` | `False` | Log detailed execution info |
+| `tools` | `list[Union[Callable, AlinGo-Prompt.Tool]]` | `None` | Additional tool functions callable from interpreter code |
+| `sub_lm` | `AlinGo-Prompt.LM` | `None` | LM for sub-queries. Defaults to `AlinGo-Prompt.settings.lm`. Use a cheaper model here. |
+| `interpreter_factory` | `Callable[[], CodeInterpreter]` | `PythonInterpreter` | Creates one interpreter per invocation. RLM shuts down each returned interpreter. `AlinGo-Prompt.configure(interpreter_factory=...)` replaces the default. A factory passed to the constructor wins, unless it is `PythonInterpreter`. May expose an optional `execution_instructions` string for the action prompt. |
+
+## Built-in Tools
+
+Inside the REPL, the LLM has access to:
+
+| Tool | Description |
+|------|-------------|
+| `llm_query(prompt)` | Query a sub-LLM for semantic analysis (~500K char capacity). `prompt` may be a list of strings and DSPy values, such as images |
+| `llm_query_batched(prompts)` | Query multiple prompts concurrently (faster for batch operations) |
+| `print()` | Print output (required to see results) |
+| `SUBMIT(...)` | Submit final output and end execution |
+| Standard library | `re`, `json`, `collections`, `math`, etc. |
+
+## Examples
+
+### Long Document Q&A
+
+```python
+import AlinGo-Prompt
+
+AlinGo-Prompt.configure(lm=AlinGo-Prompt.LM("openai/gpt-5"))
+
+rlm = AlinGo-Prompt.RLM("document, question -> answer", max_iters=10)
+
+with open("large_report.txt") as f:
+    document = f.read()  # 500K+ characters
+
+result = rlm(
+    document=document,
+    question="What were the key findings from Q3?"
+)
+print(result.answer)
+```
+
+### Using a Cheaper Sub-LM
+
+```python
+import AlinGo-Prompt
+
+main_lm = AlinGo-Prompt.LM("openai/gpt-5")
+cheap_lm = AlinGo-Prompt.LM("openai/gpt-5-nano")
+
+AlinGo-Prompt.configure(lm=main_lm)
+
+# Root LM (gpt-5) decides strategy; sub-LM (gpt-5-nano) handles extraction
+rlm = AlinGo-Prompt.RLM("data, query -> summary", sub_lm=cheap_lm)
+```
+
+### Multiple Typed Outputs
+
+```python
+rlm = AlinGo-Prompt.RLM("logs -> error_count: int, critical_errors: list[str]")
+
+result = rlm(logs=server_logs)
+print(f"Found {result.error_count} errors")
+print(f"Critical: {result.critical_errors}")
+```
+
+### Custom Tools
+
+```python
+def fetch_metadata(doc_id: str) -> str:
+    """Fetch metadata for a document ID."""
+    return database.get_metadata(doc_id)
+
+rlm = AlinGo-Prompt.RLM(
+    "documents, query -> answer",
+    tools=[fetch_metadata]
+)
+```
+
+### Configuring the Interpreter
+
+Pass the interpreter class directly when it needs no arguments. For configured construction, use any zero-argument callable, such as `functools.partial`:
+
+```python
+from functools import partial
+
+rlm = AlinGo-Prompt.RLM(
+    "context, query -> answer",
+    interpreter_factory=partial(
+        AlinGo-Prompt.PythonInterpreter,
+        enable_network_access=["example.com"],
+    ),
+)
+```
+
+One call puts the same interpreter behind every code-executing module in the program. Each invocation reads the setting, so `AlinGo-Prompt.context(interpreter_factory=...)` scopes the choice and `AlinGo-Prompt.configure(...)` reaches modules built before the call. A factory passed to a constructor still wins, unless it is `PythonInterpreter`:
+
+```python
+AlinGo-Prompt.configure(interpreter_factory=MyInterpreter)
+```
+
+RLM creates and shuts down one interpreter from this factory per invocation. It adds invocation-scoped tools to the returned interpreter's mutable `tools` dictionary, so remote sandboxes need a `CodeInterpreter` adapter that supports that protocol.
+
+To override the factory for a single invocation, pass a zero-argument callable via the `interpreter_factory` keyword:
+
+```python
+result = rlm(context=data, query=query, interpreter_factory=MyInterpreter)
+result = await rlm.acall(context=data, query=query, interpreter_factory=MyInterpreter)
+```
+
+The call-time factory takes precedence over constructor and global/context factories, including when explicitly passing `PythonInterpreter`. RLM calls it once and shuts down the returned interpreter on success or failure. The factory must return a fresh interpreter each time. Passing a live interpreter at call time is no longer supported; migrate `rlm(interpreter, ...)` to `rlm(..., interpreter_factory=factory)`. The option is keyword-only, and `interpreter_factory` is reserved for runtime configuration rather than signature inputs.
+
+If the factory exposes an `execution_instructions` string, RLM adds it to the action predictor's task instructions,
+which DSPy adapters place in the system prompt. Optimizers such as GEPA may therefore adapt the execution guidance
+along with the rest of the action policy. Factory classes and configured callable provider objects can expose this
+metadata; anonymous factories without it continue to use the generic action prompt. RLM refreshes these instructions
+for each action call, so a `AlinGo-Prompt.context(interpreter_factory=...)` override keeps the prompt aligned with the runtime
+that executes the generated code.
+
+### Custom Sandbox-Serializable Inputs
+
+For inputs that should be loaded into the sandbox differently from normal Python values, subclass `AlinGo-Prompt.SandboxSerializable`. RLM detects these inputs, sends their serialized payload into the interpreter, runs their setup code, and exposes the reconstructed value under the original input name.
+
+The value crosses on the same path as every other value the interpreter's JSON can't carry (`AlinGo-Prompt.Image` and other AlinGo-Prompt types): it is rebuilt once per call, so changes the code makes to it persist across turns. The same holds for a `AlinGo-Prompt.Flex` input, and for a provided tool's result. In RLM, a tool's result is rebuilt only when the tool's return annotation names its type (for example `-> DataFrame`); otherwise RLM reports an error rather than passing the value's string. Three limits:
+
+- Only host values are rebuilt. A `SandboxSerializable` defined by sandboxed code and passed to a host tool is refused: the host never runs code the sandbox wrote.
+- It is one-way. A value that comes back from the sandbox (via `SUBMIT` or a tool argument) is whatever the code returns, not a rebuilt `SandboxSerializable`.
+- It needs AlinGo-Prompt inside the interpreter. An interpreter that can't load it (for example a restricted compiler, or a sandbox without its cached bundle offline) raises an error for these inputs.
+
+```python
+class DataFrame(AlinGo-Prompt.SandboxSerializable):
+    def sandbox_setup(self) -> str:
+        return "import pandas as pd\nimport base64\nimport io"
+
+    def to_sandbox(self) -> bytes:
+        return base64.b64encode(self.data.to_parquet(index=False))
+
+    def sandbox_assignment(self, var_name: str, data_expr: str) -> str:
+        return f"{var_name} = pd.read_parquet(io.BytesIO(base64.b64decode({data_expr})))"
+
+    def rlm_preview(self, max_chars: int = 500) -> str:
+        return f"DataFrame: {self.data.shape[0]} rows x {self.data.shape[1]} columns"
+```
+
+`SandboxSerializable` also defines a Pydantic schema hook so subclasses can be used directly in DSPy signatures, for example `data: DataFrame = AlinGo-Prompt.InputField()`. The hook is intentionally pass-through: Pydantic accepts the object as-is and serializes it with `str(value)` for schema/metadata purposes. RLM's real sandbox transport still comes from `to_sandbox()` and `sandbox_assignment()`.
+
+### Images and Other DSPy Types
+
+Values of DSPy types such as `AlinGo-Prompt.Image` keep their type across the REPL boundary: in inputs, tool arguments and results, `SUBMIT`, `llm_query` prompt lists, and sub-agents built with `AlinGo-Prompt` in the REPL. The REPL runs AlinGo-Prompt itself, so a `AlinGo-Prompt.Image` is a `AlinGo-Prompt.Image` there, with its methods. Your own `AlinGo-Prompt.Type` subclasses and models arrive as plain data of their fields, with their methods left on the host, as in `AlinGo-Prompt.Flex`. A tool's result keeps its type when the tool's return annotation names it (`-> AlinGo-Prompt.Image`).
+
+`AlinGo-Prompt.Image.to_pil()` needs Pillow in the interpreter. `AlinGo-Prompt.LocalInterpreter` uses your environment's. `PythonInterpreter`'s sandbox includes Pyodide's build of Pillow, whether or not your environment has Pillow. Its `sandbox_packages` choose the packages Pyodide ships that the REPL can import, by default `("pillow",)`:
+
+```python
+from functools import partial
+
+import AlinGo-Prompt
+
+# numpy as well as Pillow
+rlm = AlinGo-Prompt.RLM(
+    "photo: AlinGo-Prompt.Image, question -> answer",
+    interpreter_factory=partial(
+        AlinGo-Prompt.PythonInterpreter,
+        sandbox_packages=["pillow", "numpy"],
+    ),
+)
+# no packages, for a sandbox that starts slightly faster;
+# images still pass through, but to_pil() raises ImportError
+AlinGo-Prompt.configure(
+    interpreter_factory=partial(
+        AlinGo-Prompt.PythonInterpreter,
+        sandbox_packages=[],
+    ),
+)
+```
+
+```python
+def take_screenshot() -> AlinGo-Prompt.Image:
+    ...
+
+rlm = AlinGo-Prompt.RLM("photo: AlinGo-Prompt.Image, question -> answer, crop: AlinGo-Prompt.Image", tools=[take_screenshot])
+```
+
+The model can then write code such as:
+
+```python
+crop = AlinGo-Prompt.Image(photo.to_pil().crop((600, 400, 900, 600)))
+label = llm_query(["Read the label in this crop.", crop])
+screen = take_screenshot()  # a AlinGo-Prompt.Image
+answer = AlinGo-Prompt.Predict("image: AlinGo-Prompt.Image, question -> answer")(image=screen, question=question).answer
+SUBMIT(answer, crop)
+```
+
+### Async Execution
+
+```python
+import asyncio
+
+rlm = AlinGo-Prompt.RLM("context, query -> answer")
+
+async def process():
+    result = await rlm.acall(context=data, query="Summarize this")
+    return result.answer
+
+answer = asyncio.run(process())
+```
+
+### Inspecting the Trajectory
+
+```python
+result = rlm(context=data, query="Find the magic number")
+
+# See what code the LLM executed
+for step in result.trajectory:
+    print(f"Code:\n{step['code']}")
+    print(f"Output:\n{step['output']}\n")
+```
+
+## Output
+
+RLM returns a `Prediction` with:
+
+- **Output fields** from your signature (e.g., `result.answer`)
+- **`trajectory`**: List of dicts with `reasoning`, `code`, `output` for each step
+- **`final_reasoning`**: The LLM's reasoning on the final step
+
+## Notes
+
+!!! note "Thread Safety"
+    Constructor and call-time factories may be called concurrently and must return a fresh interpreter each time. RLM retains that interpreter throughout one invocation and shuts it down afterward. `PythonInterpreter` must stay on the thread where it was first used.
+
+!!! note "Interpreter Requirements"
+    RLM defaults to `PythonInterpreter`, which requires [Deno](https://deno.land/) to be installed for the Pyodide WASM sandbox.
+    `LocalInterpreter` requires no additional runtime and provides a separate CPython process, but it is not a
+    security sandbox: generated code retains the host user's files, environment, credentials, network, and process
+    authority.
+
+## API Reference
+
+<!-- START_API_REF -->
+::: AlinGo-Prompt.RLM
+    handler: python
+    options:
+        members:
+            - __init__
+            - __call__
+            - forward
+            - aforward
+            - tools
+            - batch
+            - deepcopy
+            - dump_state
+            - get_lm
+            - load
+            - load_state
+            - named_parameters
+            - named_predictors
+            - parameters
+            - predictors
+            - reset_copy
+            - save
+            - set_lm
+        show_source: true
+        show_root_heading: true
+        heading_level: 3
+        docstring_style: google
+        show_root_full_path: true
+        show_object_full_path: false
+        separate_signature: false
+        inherited_members: true
+<!-- END_API_REF -->
